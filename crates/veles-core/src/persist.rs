@@ -43,7 +43,10 @@ const SYMBOLS_FILE: &str = "symbols.bin";
 /// Cheap fingerprint for change detection.
 ///
 /// `(size, mtime)` is fast to compute and covers almost all real edits;
-/// content hashing can be layered on later if needed.
+/// `content_hash` (BLAKE3 of the file bytes) is the fallback used by
+/// incremental update when mtime drifts but the bytes haven't changed
+/// (`touch`, `git checkout` of an identical version, no-op formatter
+/// runs).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
     /// File size in bytes.
@@ -52,6 +55,11 @@ pub struct FileFingerprint {
     pub mtime_secs: i64,
     /// Number of chunks this file produced.
     pub chunk_count: usize,
+    /// BLAKE3 hex digest of the file bytes. `None` for fingerprints
+    /// loaded from a pre-content-hash manifest; new fingerprints
+    /// always populate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
 }
 
 impl FileFingerprint {
@@ -64,12 +72,22 @@ impl FileFingerprint {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
             .unwrap_or(0);
+        let content_hash = Some(content_hash(path)?);
         Ok(Self {
             size: meta.len(),
             mtime_secs,
             chunk_count,
+            content_hash,
         })
     }
+}
+
+/// BLAKE3 hex digest of `path`'s bytes. Used both at index-build time
+/// (to populate the manifest) and at update time (to verify whether a
+/// touched file's content actually changed).
+pub fn content_hash(path: &Path) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("read {}", path.display()))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
 }
 
 /// Small JSON sidecar describing a persisted index.
@@ -285,6 +303,7 @@ mod tests {
                 size: 100,
                 mtime_secs: 1_000_000,
                 chunk_count: 2,
+                content_hash: Some("deadbeef".to_string()),
             },
         );
         m.total_chunks = 2;
@@ -295,5 +314,49 @@ mod tests {
         assert_eq!(m2.embedding_dim, 64);
         assert_eq!(m2.files.len(), 1);
         assert_eq!(m2.files["src/lib.rs"].size, 100);
+        assert_eq!(
+            m2.files["src/lib.rs"].content_hash.as_deref(),
+            Some("deadbeef")
+        );
+    }
+
+    #[test]
+    fn legacy_manifest_without_content_hash_loads() {
+        // Pre-content-hash manifests omit the field entirely. Serde
+        // must default it to None, not bail.
+        let json = r#"{
+            "veles_version": "0.2.3",
+            "format_version": 2,
+            "model_name": "test-model",
+            "embedding_dim": 64,
+            "include_text_files": false,
+            "indexed_at": 0,
+            "files": {
+                "src/lib.rs": {
+                    "size": 100,
+                    "mtime_secs": 1000000,
+                    "chunk_count": 2
+                }
+            },
+            "total_chunks": 2
+        }"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.files["src/lib.rs"].size, 100);
+        assert!(m.files["src/lib.rs"].content_hash.is_none());
+    }
+
+    #[test]
+    fn content_hash_is_deterministic_and_discriminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("a.txt");
+
+        std::fs::write(&p, b"hello").unwrap();
+        let h1 = content_hash(&p).unwrap();
+        let h2 = content_hash(&p).unwrap();
+        assert_eq!(h1, h2, "same bytes must hash the same");
+
+        std::fs::write(&p, b"hello world").unwrap();
+        let h3 = content_hash(&p).unwrap();
+        assert_ne!(h1, h3, "different bytes must hash differently");
     }
 }

@@ -19,6 +19,7 @@ regex = { workspace = true }
 walkdir = { workspace = true }
 ignore = { workspace = true }
 globset = { workspace = true }
+blake3 = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
 ahash = { version = "0.8", features = ["serde"] }

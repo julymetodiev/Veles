@@ -235,14 +235,37 @@ impl VelesIndex {
             .collect();
 
         // Classify files: unchanged / modified / added / removed.
+        //
+        // Fast path: matching (size, mtime) → unchanged without touching content.
+        // Slow path (only when fast path fails): if size matches and the
+        // previous manifest carries a BLAKE3 hash, hash the current bytes and
+        // compare. This catches `touch` / `git checkout` of an identical
+        // version / no-op formatter passes that drift the mtime without
+        // changing the bytes — saving an embedding round-trip.
         let mut unchanged: Vec<String> = Vec::new();
         let mut modified: Vec<String> = Vec::new();
         let mut added: Vec<String> = Vec::new();
+        // Hashes we computed during classification, keyed by relative path.
+        // Reused when rebuilding the manifest to avoid re-reading the file.
+        let mut computed_hashes: HashMap<String, String> = HashMap::new();
 
-        for (rel, (_abs, size, mtime)) in &on_disk {
+        for (rel, (abs, size, mtime)) in &on_disk {
             match manifest.files.get(rel) {
                 Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {
                     unchanged.push(rel.clone());
+                }
+                Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
+                    match persist::content_hash(abs) {
+                        Ok(h) if Some(&h) == prev.content_hash.as_ref() => {
+                            unchanged.push(rel.clone());
+                            computed_hashes.insert(rel.clone(), h);
+                        }
+                        Ok(h) => {
+                            modified.push(rel.clone());
+                            computed_hashes.insert(rel.clone(), h);
+                        }
+                        Err(_) => modified.push(rel.clone()),
+                    }
                 }
                 Some(_) => modified.push(rel.clone()),
                 None => added.push(rel.clone()),
@@ -364,13 +387,33 @@ impl VelesIndex {
         for c in &all_chunks {
             *chunk_counts.entry(c.file_path.as_str()).or_default() += 1;
         }
-        for (rel, (_abs, size, mtime)) in &on_disk {
+        let unchanged_set: HashSet<&str> = unchanged.iter().map(|s| s.as_str()).collect();
+        for (rel, (abs, size, mtime)) in &on_disk {
+            // Resolve a content hash for this file:
+            //  - prefer the value we already computed during classification;
+            //  - else, for unchanged files, carry over the previous hash if
+            //    it was already populated (avoids wasted work);
+            //  - else, hash now (modified / added files, or unchanged files
+            //    whose previous manifest predates content-hash support).
+            let content_hash = if let Some(h) = computed_hashes.remove(rel) {
+                Some(h)
+            } else if unchanged_set.contains(rel.as_str()) {
+                manifest
+                    .files
+                    .get(rel)
+                    .and_then(|p| p.content_hash.clone())
+                    .or_else(|| persist::content_hash(abs).ok())
+            } else {
+                persist::content_hash(abs).ok()
+            };
+
             new_manifest.files.insert(
                 rel.clone(),
                 FileFingerprint {
                     size: *size,
                     mtime_secs: *mtime,
                     chunk_count: chunk_counts.get(rel.as_str()).copied().unwrap_or(0),
+                    content_hash,
                 },
             );
         }
