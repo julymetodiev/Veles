@@ -18,7 +18,8 @@ walkdir = { workspace = true }
 ignore = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
-ahash = "0.8"
+ahash = { version = "0.8", features = ["serde"] }
+bincode = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

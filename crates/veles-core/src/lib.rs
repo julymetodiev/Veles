@@ -7,6 +7,7 @@
 pub mod chunker;
 pub mod index;
 pub mod model;
+pub mod persist;
 pub mod ranking;
 pub mod veles_index;
 pub mod tokenizer;

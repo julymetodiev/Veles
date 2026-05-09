@@ -37,6 +37,9 @@ tonic = "0.12"
 prost = "0.13"
 tonic-build = "0.12"
 
+# Persistence
+bincode = "1.3"
+
 # Workspace crate deps
 veles-core = { path = "crates/veles-core" }
 veles-grpc = { path = "crates/veles-grpc" }

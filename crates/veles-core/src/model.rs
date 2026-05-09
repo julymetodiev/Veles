@@ -1,7 +1,7 @@
 //! Model loading wrapper around model2vec-rs.
 
 use anyhow::Result;
-use model2vec_rs::model::StaticModel;
+pub use model2vec_rs::model::StaticModel;
 
 /// Default model for code search (English-focused, code-specialised, ~16M params).
 pub const DEFAULT_MODEL_NAME: &str = "minishlab/potion-code-16M";

@@ -7,20 +7,21 @@
 
 use ahash::AHashMap;
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 /// BM25 parameters.
 const K1: f64 = 1.5;
 const B: f64 = 0.75;
 
 /// One entry in a postings list.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 struct Posting {
     doc: u32,
     tf: u32,
 }
 
 /// A BM25 index over a corpus of tokenized documents.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Bm25Index {
     /// Number of documents in the corpus.
     num_docs: usize,

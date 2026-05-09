@@ -12,6 +12,7 @@ use crate::index::dense::DenseIndex;
 use crate::index::search::{search_bm25, search_hybrid, search_semantic};
 use crate::index::sparse::Bm25Index;
 use crate::model;
+use crate::persist::{self, FileFingerprint, Manifest, UpdateReport};
 use crate::tokenizer::tokenize_into;
 use crate::types::{Chunk, IndexStats, SearchMode, SearchResult};
 use crate::walker;
@@ -24,6 +25,10 @@ pub struct VelesIndex {
     dense_index: DenseIndex,
     file_mapping: HashMap<String, Vec<usize>>,
     language_mapping: HashMap<String, Vec<usize>>,
+    /// Per-file fingerprints + model metadata. Populated on `from_path`,
+    /// `from_git`, `load`, and `update_from_path`. Used by `save` and
+    /// `update_from_path` for incremental rebuilds.
+    manifest: Option<Manifest>,
 }
 
 impl VelesIndex {
@@ -53,6 +58,13 @@ impl VelesIndex {
         let (bm25_index, dense_index) = build_indexes(&model, &chunks);
         let (file_mapping, language_mapping) = build_mappings(&chunks);
 
+        let manifest = Some(build_manifest(
+            &path,
+            &chunks,
+            &dense_index,
+            include_text_files,
+        ));
+
         Ok(Self {
             model,
             chunks,
@@ -60,6 +72,7 @@ impl VelesIndex {
             dense_index,
             file_mapping,
             language_mapping,
+            manifest,
         })
     }
 
@@ -102,6 +115,9 @@ impl VelesIndex {
         let (bm25_index, dense_index) = build_indexes(&model, &chunks);
         let (file_mapping, language_mapping) = build_mappings(&chunks);
 
+        // Manifest is intentionally not populated for git-cloned indexes:
+        // the temp directory disappears on drop, so persisting/updating
+        // against it would be meaningless.
         Ok(Self {
             model,
             chunks,
@@ -109,7 +125,222 @@ impl VelesIndex {
             dense_index,
             file_mapping,
             language_mapping,
+            manifest: None,
         })
+    }
+
+    /// Persist the index to `<repo_root>/.veles/`.
+    pub fn save(&self, repo_root: &Path) -> Result<()> {
+        let manifest = self
+            .manifest
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Index has no manifest — cannot persist (was it built from a git URL?)"))?;
+        persist::save(
+            repo_root,
+            manifest,
+            &self.chunks,
+            &self.bm25_index,
+            &self.dense_index,
+        )
+    }
+
+    /// Load a persisted index from `<repo_root>/.veles/`.
+    ///
+    /// The `model` must match the model the index was built with — a mismatch
+    /// gives meaningless similarity scores. We check the model name in the
+    /// manifest against the provided model id (if known).
+    pub fn load(repo_root: &Path, model: StaticModel) -> Result<Self> {
+        let persisted = persist::load(repo_root)?;
+        let (file_mapping, language_mapping) = build_mappings(&persisted.chunks);
+        Ok(Self {
+            model,
+            chunks: persisted.chunks,
+            bm25_index: persisted.bm25,
+            dense_index: persisted.dense,
+            file_mapping,
+            language_mapping,
+            manifest: Some(persisted.manifest),
+        })
+    }
+
+    /// Borrow the manifest, if available.
+    pub fn manifest(&self) -> Option<&Manifest> {
+        self.manifest.as_ref()
+    }
+
+    /// Incrementally update the index against the current state of `repo_root`.
+    ///
+    /// Files whose (size, mtime) fingerprint matches the manifest keep their
+    /// chunks and embeddings untouched. Modified/added files are re-chunked
+    /// and re-embedded. Removed files are dropped. BM25 and dense indexes are
+    /// rebuilt from the union of kept + new chunks (cheap relative to
+    /// re-embedding the whole corpus).
+    pub fn update_from_path(&mut self, repo_root: &Path) -> Result<UpdateReport> {
+        let root = repo_root.canonicalize()?;
+        if !root.is_dir() {
+            bail!("Path is not a directory: {}", root.display());
+        }
+
+        let manifest = self
+            .manifest
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Index has no manifest — call `from_path` or `load` first"))?;
+
+        let exts = walker::filter_extensions(None, manifest.include_text_files);
+
+        // Discover files currently on disk and their fingerprints (without
+        // chunk_count — that's filled in after chunking).
+        let on_disk: HashMap<String, (PathBuf, u64, i64)> =
+            walker::walk_files(&root, &exts)
+                .filter_map(|abs_path| {
+                    let rel = abs_path
+                        .strip_prefix(&root)
+                        .ok()?
+                        .to_string_lossy()
+                        .into_owned();
+                    let meta = std::fs::metadata(&abs_path).ok()?;
+                    let mtime = meta
+                        .modified()
+                        .ok()?
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    Some((rel, (abs_path, meta.len(), mtime)))
+                })
+                .collect();
+
+        // Classify files: unchanged / modified / added / removed.
+        let mut unchanged: Vec<String> = Vec::new();
+        let mut modified: Vec<String> = Vec::new();
+        let mut added: Vec<String> = Vec::new();
+
+        for (rel, (_abs, size, mtime)) in &on_disk {
+            match manifest.files.get(rel) {
+                Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {
+                    unchanged.push(rel.clone());
+                }
+                Some(_) => modified.push(rel.clone()),
+                None => added.push(rel.clone()),
+            }
+        }
+        let removed: Vec<String> = manifest
+            .files
+            .keys()
+            .filter(|k| !on_disk.contains_key(*k))
+            .cloned()
+            .collect();
+
+        // Fast path: nothing to do.
+        if modified.is_empty() && added.is_empty() && removed.is_empty() {
+            return Ok(UpdateReport {
+                added_files: 0,
+                modified_files: 0,
+                removed_files: 0,
+                kept_chunks: self.chunks.len(),
+                new_chunks: 0,
+                total_chunks: self.chunks.len(),
+            });
+        }
+
+        // Build the keep set: indices of chunks belonging to unchanged files.
+        let unchanged_set: HashSet<&str> = unchanged.iter().map(|s| s.as_str()).collect();
+        let mut keep_indices: Vec<usize> = Vec::new();
+        for (i, chunk) in self.chunks.iter().enumerate() {
+            if unchanged_set.contains(chunk.file_path.as_str()) {
+                keep_indices.push(i);
+            }
+        }
+
+        // Reuse embeddings of unchanged chunks (rows of the dense matrix —
+        // already L2-normalised; re-normalising is a no-op).
+        let kept_embeddings = self.dense_index.extract_rows(&keep_indices);
+        let kept_chunks: Vec<Chunk> =
+            keep_indices.iter().map(|&i| self.chunks[i].clone()).collect();
+
+        // Chunk modified + added files.
+        let mut to_chunk: Vec<String> = Vec::with_capacity(modified.len() + added.len());
+        to_chunk.extend(modified.iter().cloned());
+        to_chunk.extend(added.iter().cloned());
+
+        let new_chunks: Vec<Chunk> = to_chunk
+            .par_iter()
+            .flat_map_iter(|rel| {
+                let abs = match on_disk.get(rel) {
+                    Some((abs, _, _)) => abs.clone(),
+                    None => return Vec::new().into_iter(),
+                };
+                let language = walker::language_for_path(&abs).map(|s| s.to_string());
+                let content = match std::fs::read_to_string(&abs) {
+                    Ok(c) => c,
+                    Err(_) => return Vec::new().into_iter(),
+                };
+                chunker::chunk_source(&content, rel, language.as_deref()).into_iter()
+            })
+            .collect();
+
+        // Embed only the new chunks (the expensive step we save).
+        let new_texts: Vec<String> = new_chunks.iter().map(|c| c.content.clone()).collect();
+        let new_embeddings = if new_texts.is_empty() {
+            Vec::new()
+        } else {
+            self.model.encode(&new_texts)
+        };
+
+        // Combine kept + new.
+        let mut all_chunks = kept_chunks;
+        all_chunks.extend(new_chunks.iter().cloned());
+        let mut all_embeddings = kept_embeddings;
+        all_embeddings.extend(new_embeddings);
+
+        // Rebuild BM25 from full token set, dense from combined embeddings.
+        let bm25_index = build_bm25(&all_chunks);
+        let dense_index = DenseIndex::new(all_embeddings);
+        let (file_mapping, language_mapping) = build_mappings(&all_chunks);
+
+        // Build a fresh manifest.
+        let mut new_manifest = Manifest::new(
+            &manifest.model_name,
+            self.dense_index.dim().max(dense_index.dim()),
+            manifest.include_text_files,
+        );
+        new_manifest.embedding_dim = dense_index.dim();
+        new_manifest.total_chunks = all_chunks.len();
+
+        // Per-file chunk counts for the new state.
+        let mut chunk_counts: HashMap<&str, usize> = HashMap::new();
+        for c in &all_chunks {
+            *chunk_counts.entry(c.file_path.as_str()).or_default() += 1;
+        }
+        for (rel, (_abs, size, mtime)) in &on_disk {
+            new_manifest.files.insert(
+                rel.clone(),
+                FileFingerprint {
+                    size: *size,
+                    mtime_secs: *mtime,
+                    chunk_count: chunk_counts.get(rel.as_str()).copied().unwrap_or(0),
+                },
+            );
+        }
+
+        let report = UpdateReport {
+            added_files: added.len(),
+            modified_files: modified.len(),
+            removed_files: removed.len(),
+            kept_chunks: keep_indices.len(),
+            new_chunks: new_chunks.len(),
+            total_chunks: all_chunks.len(),
+        };
+
+        self.chunks = all_chunks;
+        self.bm25_index = bm25_index;
+        self.dense_index = dense_index;
+        self.file_mapping = file_mapping;
+        self.language_mapping = language_mapping;
+        self.manifest = Some(new_manifest);
+
+        Ok(report)
     }
 
     /// Search the index and return the top-k most relevant chunks.
@@ -281,8 +512,19 @@ fn collect_chunks(
 
 /// Build BM25 and dense indexes from chunks.
 fn build_indexes(model: &StaticModel, chunks: &[Chunk]) -> (Bm25Index, DenseIndex) {
-    // Tokenize for BM25 in parallel; reuse a per-thread token buffer to avoid
-    // re-allocating for every chunk.
+    let bm25_index = build_bm25(chunks);
+
+    // Build dense index. Embedding is single-call (`model.encode` batches
+    // internally on a thread pool), so we feed it `&str` to avoid cloning.
+    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
+    let embeddings = model.encode(&texts);
+    let dense_index = DenseIndex::new(embeddings);
+
+    (bm25_index, dense_index)
+}
+
+/// Tokenize chunks (with path enrichment) and build a BM25 index.
+fn build_bm25(chunks: &[Chunk]) -> Bm25Index {
     let tokenized: Vec<Vec<String>> = chunks
         .par_iter()
         .map(|chunk| {
@@ -292,16 +534,40 @@ fn build_indexes(model: &StaticModel, chunks: &[Chunk]) -> (Bm25Index, DenseInde
             tokens
         })
         .collect();
+    Bm25Index::new(&tokenized)
+}
 
-    let bm25_index = Bm25Index::new(&tokenized);
+/// Build a fresh `Manifest` describing a freshly-built index over `repo_root`.
+fn build_manifest(
+    repo_root: &Path,
+    chunks: &[Chunk],
+    dense: &DenseIndex,
+    include_text_files: bool,
+) -> Manifest {
+    let model_name = if include_text_files {
+        // Heuristic; the field is informational. Real model name is set
+        // explicitly by the caller via persist::save when relevant.
+        crate::model::DEFAULT_MODEL_NAME.to_string()
+    } else {
+        crate::model::DEFAULT_MODEL_NAME.to_string()
+    };
+    let mut manifest = Manifest::new(&model_name, dense.dim(), include_text_files);
+    manifest.total_chunks = chunks.len();
 
-    // Build dense index. Embedding is single-call (`model.encode` batches
-    // internally on a thread pool), so we feed it `&str` to avoid cloning.
-    let texts: Vec<String> = chunks.iter().map(|c| c.content.clone()).collect();
-    let embeddings = model.encode(&texts);
-    let dense_index = DenseIndex::new(embeddings);
+    // Aggregate chunk counts per file.
+    let mut counts: HashMap<&str, usize> = HashMap::new();
+    for c in chunks {
+        *counts.entry(c.file_path.as_str()).or_default() += 1;
+    }
 
-    (bm25_index, dense_index)
+    for (rel, count) in counts {
+        let abs = repo_root.join(rel);
+        if let Ok(fp) = FileFingerprint::from_path(&abs, count) {
+            manifest.files.insert(rel.to_string(), fp);
+        }
+    }
+
+    manifest
 }
 
 /// Append file path component tokens to a tokenized BM25 document.

@@ -9,6 +9,7 @@
 //! computed via a bounded min-heap (O(N log k)) instead of a full sort.
 
 use rayon::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::index::topk::top_k_from_iter_f32;
 
@@ -16,7 +17,7 @@ use crate::index::topk::top_k_from_iter_f32;
 const PARALLEL_THRESHOLD: usize = 1024;
 
 /// A dense vector index supporting top-k nearest-neighbor search via cosine similarity.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DenseIndex {
     /// Flat row-major matrix: N rows of `dim` f32 values, all L2-normalised.
     matrix: Vec<f32>,
@@ -56,6 +57,24 @@ impl DenseIndex {
     /// Returns true if the index is empty.
     pub fn is_empty(&self) -> bool {
         self.n == 0
+    }
+
+    /// Embedding dimensionality.
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Extract the (already L2-normalised) row vectors for the given chunk
+    /// indices, in the order provided. Used by incremental update to reuse
+    /// embeddings of unchanged chunks without re-running the model.
+    pub fn extract_rows(&self, indices: &[usize]) -> Vec<Vec<f32>> {
+        let mut out = Vec::with_capacity(indices.len());
+        for &i in indices {
+            if i < self.n {
+                out.push(self.row(i).to_vec());
+            }
+        }
+        out
     }
 
     /// Borrow row `i` as a slice.
