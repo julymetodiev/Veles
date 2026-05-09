@@ -68,7 +68,7 @@ veles search "BM25" --min-score 0.4
 veles find-related src/main.rs 42
 
 # Remote repo (cloned to temp, no persistent cache)
-veles search "BM25 inverted index" https://github.com/MinishLab/semble
+veles search "BM25 inverted index" https://github.com/julymetodiev/Veles
 
 # Multilingual model
 veles search "функция обработка" . --multilingual
