@@ -15,7 +15,7 @@ Originally inspired by [Semble](https://github.com/MinishLab/semble) — Veles s
 </p>
 
 <p align="center">
-  <sub><code>veles tui</code> — live hybrid search, ~10ms per keystroke. <a href=".assets/tui-demo.mp4">MP4 version</a></sub>
+  <sub><code>veles tui</code> — live hybrid search, ~10ms per keystroke.</sub>
 </p>
 
 ## Interfaces
