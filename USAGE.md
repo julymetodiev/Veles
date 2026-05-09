@@ -16,6 +16,7 @@ see the [README](README.md).
 - [Multilingual content](#multilingual-content)
 - [Recipes](#recipes)
 - [MCP / gRPC servers](#mcp--grpc-servers)
+- [Shell completions and man page](#shell-completions-and-man-page)
 - [Troubleshooting](#troubleshooting)
 
 ## Install
@@ -341,6 +342,67 @@ veles serve-grpc --addr "[::1]:50051"
 
 The MCP server exposes `search` and `find_related` as tools. See
 `crates/veles-mcp/src/lib.rs` for the JSON-RPC schema.
+
+## Shell completions and man page
+
+`veles` ships its own completion generators and a `man(7)` page,
+so there are no extra files to download.
+
+### Zsh
+
+```sh
+mkdir -p ~/.zfunc
+veles completions zsh > ~/.zfunc/_veles
+# Once, in ~/.zshrc:
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
+```
+
+### Bash
+
+```sh
+veles completions bash | sudo tee /etc/bash_completion.d/veles >/dev/null
+# Or for current user only:
+veles completions bash > ~/.local/share/bash-completion/completions/veles
+```
+
+### Fish
+
+```sh
+veles completions fish > ~/.config/fish/completions/veles.fish
+```
+
+### PowerShell
+
+```powershell
+veles completions powershell | Out-String | Invoke-Expression
+# To persist, append the output to your $PROFILE.
+```
+
+### Elvish
+
+```sh
+veles completions elvish > ~/.config/elvish/lib/veles.elv
+# Then in rc.elv: use veles
+```
+
+### Man page
+
+```sh
+# Project-local install (no sudo):
+mkdir -p ~/.local/share/man/man1
+veles man > ~/.local/share/man/man1/veles.1
+# Make sure ~/.local/share/man is on $MANPATH.
+
+# System-wide (Linux):
+veles man | sudo tee /usr/local/share/man/man1/veles.1 >/dev/null
+
+# View it:
+man veles
+```
+
+The top-level page lists every subcommand. For per-subcommand
+help, use `veles <subcommand> --help`.
 
 ## Troubleshooting
 

@@ -15,7 +15,8 @@ mod format;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
+use clap_complete::{Shell, generate};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use veles_core::VelesIndex;
@@ -161,6 +162,25 @@ enum Commands {
         #[arg(long)]
         include_text_files: bool,
     },
+
+    /// Print a shell completion script to stdout.
+    ///
+    /// Examples:
+    ///   veles completions zsh > ~/.zfunc/_veles
+    ///   veles completions bash > /etc/bash_completion.d/veles
+    ///   veles completions fish > ~/.config/fish/completions/veles.fish
+    Completions {
+        /// Target shell.
+        #[arg(value_enum)]
+        shell: Shell,
+    },
+
+    /// Print a roff(7) man page to stdout (suitable for `/usr/local/share/man/man1/veles.1`).
+    ///
+    /// Examples:
+    ///   veles man > veles.1
+    ///   veles man | gzip > /usr/local/share/man/man1/veles.1.gz
+    Man,
 }
 
 #[tokio::main]
@@ -396,6 +416,19 @@ async fn main() -> Result<()> {
             } else {
                 println!("No index to remove at {}/.veles", path_buf.display());
             }
+        }
+
+        Some(Commands::Completions { shell }) => {
+            let mut cmd = Cli::command();
+            let bin_name = cmd.get_name().to_string();
+            generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        }
+
+        Some(Commands::Man) => {
+            let cmd = Cli::command();
+            let man = clap_mangen::Man::new(cmd);
+            man.render(&mut std::io::stdout())
+                .context("render man page")?;
         }
 
         Some(Commands::ServeGrpc { addr }) => {
