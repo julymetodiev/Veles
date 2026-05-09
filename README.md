@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=".assets/veles.png" alt="Veles" width="320">
+</p>
+
 # Veles
 
 Fast, hybrid (BM25 + semantic) local code search for AI agents and humans, written in pure Rust.
