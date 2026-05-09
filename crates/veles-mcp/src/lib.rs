@@ -14,6 +14,11 @@
 //! - `defs` — every tree-sitter definition with the given name
 //!   (Rust, Python, JavaScript, TypeScript, Go). More precise than
 //!   `search` when the symbol name is known.
+//! - `symbols` — the tree-sitter outline of a single file. A cheap
+//!   alternative to reading the whole file when only the structure
+//!   matters.
+//! - `refs` — definitions plus BM25 hits for a symbol name. One call
+//!   to answer both "where is X defined" and "where is X used".
 //! - `find_related` — semantically similar chunks for a `(file, line)`
 //!   pair returned by an earlier `search`.
 //!
@@ -167,6 +172,47 @@ fn tools() -> Vec<Tool> {
                     "kind": {
                         "type": "string",
                         "description": "Restrict to a single symbol kind (e.g. 'function', 'struct', 'class', 'enum', 'trait', 'method')."
+                    }
+                },
+                "required": ["name"]
+            }),
+        },
+        Tool {
+            name: "symbols".into(),
+            description: "List every tree-sitter definition in a single file (functions, structs, classes, methods, ...). Cheap alternative to reading a whole file when you only need its outline. Supported languages: Rust, Python, JavaScript, TypeScript, Go.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "file_path": {
+                        "type": "string",
+                        "description": "Path to the file as stored in the index (relative to `repo`)."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    }
+                },
+                "required": ["file_path"]
+            }),
+        },
+        Tool {
+            name: "refs".into(),
+            description: "Find references to a symbol — its tree-sitter definitions plus BM25 hits in chunks that mention the name. Use when you want both 'where is X defined' and 'where is X used' in one call.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Symbol name to look up."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "Number of BM25 hits to return (definitions are always included).",
+                        "default": 10
                     }
                 },
                 "required": ["name"]
@@ -377,6 +423,8 @@ impl McpServer {
             "search" => self.handle_search(arguments).await,
             "find_related" => self.handle_find_related(arguments).await,
             "defs" => self.handle_defs(arguments).await,
+            "symbols" => self.handle_symbols(arguments).await,
+            "refs" => self.handle_refs(arguments).await,
             _ => Err(JsonRpcError {
                 code: -32602,
                 message: format!("Unknown tool: {tool_name}"),
@@ -480,6 +528,96 @@ impl McpServer {
 
         Ok(json!({
             "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_symbols(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let file_path = args["file_path"].as_str().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'file_path' parameter".into(),
+        })?;
+        let repo = args["repo"].as_str().unwrap_or(".");
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        let mut hits = index.symbols_for_file(file_path);
+        hits.sort_by_key(|s| s.start_line);
+
+        if hits.is_empty() {
+            return Ok(json!({
+                "content": [{"type": "text", "text": format!("No tree-sitter symbols found in {file_path}. The file may be in an unsupported language (supported: rust, python, javascript, typescript, go) or not part of the indexed repo.")}]
+            }));
+        }
+
+        let header = format!("Symbols in {file_path}");
+        let text = format_symbols(&header, &hits);
+
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_refs(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let name = args["name"].as_str().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'name' parameter".into(),
+        })?;
+        let repo = args["repo"].as_str().unwrap_or(".");
+        let top_k = args["top_k"].as_u64().unwrap_or(10) as usize;
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        let mut defs: Vec<&Symbol> = index.symbols().iter().filter(|s| s.name == name).collect();
+        defs.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+        });
+
+        let bm25_hits = index.search(name, top_k, SearchMode::Bm25, None, None, None);
+
+        if defs.is_empty() && bm25_hits.is_empty() {
+            return Ok(json!({
+                "content": [{"type": "text", "text": format!("No definitions or BM25 hits found for {name:?}.")}]
+            }));
+        }
+
+        let mut lines: Vec<String> = vec![format!("References to {name:?}"), String::new()];
+        if defs.is_empty() {
+            lines.push("## Definitions".to_string());
+            lines.push("(none)".to_string());
+        } else {
+            lines.push("## Definitions".to_string());
+            for s in &defs {
+                lines.push(format!(
+                    "- {kind} {name} ({lang}) — {file}:{line}",
+                    kind = s.kind.as_str(),
+                    name = s.name,
+                    lang = s.language,
+                    file = s.file_path,
+                    line = s.start_line,
+                ));
+            }
+        }
+        lines.push(String::new());
+        if bm25_hits.is_empty() {
+            lines.push("## Other matches (BM25)".to_string());
+            lines.push("(none)".to_string());
+        } else {
+            let header = format!("## Other matches (BM25) — {} hit(s)", bm25_hits.len());
+            lines.push(format_results(&header, &bm25_hits));
+        }
+
+        Ok(json!({
+            "content": [{"type": "text", "text": lines.join("\n")}]
         }))
     }
 
