@@ -95,6 +95,7 @@
 //! [model2vec]: https://github.com/MinishLab/model2vec-rs
 
 pub mod chunker;
+pub mod filter;
 pub mod index;
 pub mod model;
 pub mod persist;

@@ -28,6 +28,7 @@ rayon = "1"
 regex = "1"
 walkdir = "2"
 ignore = "0.4"            # gitignore-aware file walker (ripgrep's crate)
+globset = "0.4"           # glob path filter shared by CLI and MCP
 path-clean = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"

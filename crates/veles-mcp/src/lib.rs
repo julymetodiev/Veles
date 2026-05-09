@@ -8,7 +8,12 @@
 //! # Tools exposed to the agent
 //!
 //! - `search` — natural-language or code query against a local
-//!   directory or `https://` git URL.
+//!   directory or `https://` git URL. Optional `lang` / `path` /
+//!   `exclude` glob filters and a `min_score` threshold narrow
+//!   noisy queries.
+//! - `defs` — every tree-sitter definition with the given name
+//!   (Rust, Python, JavaScript, TypeScript, Go). More precise than
+//!   `search` when the symbol name is known.
 //! - `find_related` — semantically similar chunks for a `(file, line)`
 //!   pair returned by an earlier `search`.
 //!
@@ -49,6 +54,8 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use veles_core::VelesIndex;
+use veles_core::filter;
+use veles_core::symbols::Symbol;
 use veles_core::types::SearchMode;
 
 // ── JSON-RPC Types ────────────────────────────────────────────────────────
@@ -93,7 +100,7 @@ fn tools() -> Vec<Tool> {
     vec![
         Tool {
             name: "search".into(),
-            description: "Search a codebase with a natural-language or code query. Pass `repo` as a local directory path or an https:// git URL. The index is cached after the first call, so repeat queries are fast.".into(),
+            description: "Search a codebase with a natural-language or code query. Pass `repo` as a local directory path or an https:// git URL. The index is cached after the first call, so repeat queries are fast. Use `lang`, `path`, `exclude`, and `min_score` to narrow noisy queries.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -114,9 +121,55 @@ fn tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Number of results to return.",
                         "default": 5
+                    },
+                    "lang": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict results to these languages (e.g. ['rust', 'python'])."
+                    },
+                    "path": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to include (e.g. ['src/**/*.rs'])."
+                    },
+                    "exclude": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Glob patterns of paths to exclude (e.g. ['tests/**', '**/legacy/**'])."
+                    },
+                    "min_score": {
+                        "type": "number",
+                        "description": "Drop results whose score is below this threshold."
                     }
                 },
                 "required": ["query"]
+            }),
+        },
+        Tool {
+            name: "defs".into(),
+            description: "Find every tree-sitter definition with the given name (functions, structs, classes, ...) across the indexed repo. More precise than `search` when you already know the symbol name. Supported languages: Rust, Python, JavaScript, TypeScript, Go.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "Exact symbol name to look up."
+                    },
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    },
+                    "lang": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Restrict results to these languages."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Restrict to a single symbol kind (e.g. 'function', 'struct', 'class', 'enum', 'trait', 'method')."
+                    }
+                },
+                "required": ["name"]
             }),
         },
         Tool {
@@ -323,6 +376,7 @@ impl McpServer {
         match tool_name {
             "search" => self.handle_search(arguments).await,
             "find_related" => self.handle_find_related(arguments).await,
+            "defs" => self.handle_defs(arguments).await,
             _ => Err(JsonRpcError {
                 code: -32602,
                 message: format!("Unknown tool: {tool_name}"),
@@ -343,13 +397,31 @@ impl McpServer {
 
         let top_k = args["top_k"].as_u64().unwrap_or(5) as usize;
 
+        let lang = string_array(&args, "lang");
+        let path_globs = string_array(&args, "path");
+        let exclude_globs = string_array(&args, "exclude");
+        let min_score = args["min_score"].as_f64();
+
         let mut cache = self.cache.lock().await;
         let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
             code: -32000,
             message: e.to_string(),
         })?;
 
-        let results = index.search(query, top_k, mode, None, None, None);
+        let glob_paths =
+            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+                JsonRpcError {
+                    code: -32000,
+                    message: e.to_string(),
+                }
+            })?;
+        let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
+        let path_slice: Option<&[String]> = glob_paths.as_deref();
+
+        let mut results = index.search(query, top_k, mode, None, lang_slice, path_slice);
+        if let Some(threshold) = min_score {
+            results.retain(|r| r.score >= threshold);
+        }
 
         if results.is_empty() {
             return Ok(json!({
@@ -359,6 +431,52 @@ impl McpServer {
 
         let header = format!("Search results for: {query:?} (mode={mode_str})");
         let text = format_results(&header, &results);
+
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
+        }))
+    }
+
+    async fn handle_defs(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let name = args["name"].as_str().ok_or_else(|| JsonRpcError {
+            code: -32602,
+            message: "Missing 'name' parameter".into(),
+        })?;
+
+        let repo = args["repo"].as_str().unwrap_or(".");
+        let lang = string_array(&args, "lang");
+        let kind_filter = args["kind"].as_str().map(|s| s.to_ascii_lowercase());
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        let mut hits: Vec<&Symbol> = index
+            .symbols()
+            .iter()
+            .filter(|s| s.name == name)
+            .filter(|s| lang.is_empty() || lang.iter().any(|l| l == &s.language))
+            .filter(|s| match &kind_filter {
+                Some(k) => s.kind.as_str() == k,
+                None => true,
+            })
+            .collect();
+        hits.sort_by(|a, b| {
+            a.file_path
+                .cmp(&b.file_path)
+                .then(a.start_line.cmp(&b.start_line))
+        });
+
+        if hits.is_empty() {
+            return Ok(json!({
+                "content": [{"type": "text", "text": format!("No definitions named {name:?} found.")}]
+            }));
+        }
+
+        let header = format!("Definitions of {name:?}");
+        let text = format_symbols(&header, &hits);
 
         Ok(json!({
             "content": [{"type": "text", "text": text}]
@@ -408,6 +526,36 @@ impl McpServer {
             "content": [{"type": "text", "text": text}]
         }))
     }
+}
+
+/// Pull a `Vec<String>` from a JSON arg that's either an array of strings or absent.
+/// A single string value is also accepted and wrapped in a one-element vec, so
+/// callers that send `"lang": "rust"` instead of `"lang": ["rust"]` still work.
+fn string_array(args: &Value, key: &str) -> Vec<String> {
+    match args.get(key) {
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+        Some(Value::String(s)) => vec![s.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Format symbol hits as `kind name (lang) — file:line` lines under a header.
+fn format_symbols(header: &str, symbols: &[&Symbol]) -> String {
+    let mut lines: Vec<String> = vec![header.to_string(), String::new()];
+    for s in symbols {
+        lines.push(format!(
+            "- {kind} {name} ({lang}) — {file}:{line}",
+            kind = s.kind.as_str(),
+            name = s.name,
+            lang = s.language,
+            file = s.file_path,
+            line = s.start_line,
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Format search results as numbered, fenced code blocks (same format as Python version).
