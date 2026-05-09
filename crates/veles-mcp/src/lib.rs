@@ -153,8 +153,8 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["default", "paths"],
-                        "description": "'default' returns scored, fenced code blocks with the enclosing scope. 'paths' returns just `path:start-end` per line — token-cheap shortlist for downstream processing."
+                        "enum": ["default", "paths", "unique_paths"],
+                        "description": "'default' returns scored, fenced code blocks with the enclosing scope. 'paths' returns just `path:start-end` per line — token-cheap shortlist for downstream processing. 'unique_paths' collapses multiple hits in the same file to a single `path` line; use it when you want a shortlist of *which files* matter, not *which chunks*."
                     }
                 },
                 "required": ["query"]
@@ -226,8 +226,8 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["default", "paths"],
-                        "description": "'default' splits into a Definitions section and a BM25 section with code blocks. 'paths' flattens both into a single `path:line` / `path:start-end` list."
+                        "enum": ["default", "paths", "unique_paths"],
+                        "description": "'default' splits into a Definitions section and a BM25 section with code blocks. 'paths' flattens both into a single `path:line` / `path:start-end` list. 'unique_paths' collapses everything to one `path` line per file."
                     }
                 },
                 "required": ["name"]
@@ -299,8 +299,8 @@ fn tools() -> Vec<Tool> {
                     },
                     "format": {
                         "type": "string",
-                        "enum": ["default", "paths"],
-                        "description": "'default' returns scored code blocks with the enclosing scope; 'paths' returns just `path:start-end` per line."
+                        "enum": ["default", "paths", "unique_paths"],
+                        "description": "'default' returns scored code blocks with the enclosing scope; 'paths' returns just `path:start-end` per line; 'unique_paths' collapses to one `path` per file."
                     }
                 },
                 "required": ["file_path", "line"]
@@ -553,11 +553,13 @@ impl McpServer {
             }));
         }
 
-        let text = if format == "paths" {
-            format_results_paths(&results)
-        } else {
-            let header = format!("Search results for: {query:?} (mode={mode_str})");
-            format_results(&header, &results, Some(index.symbols()))
+        let text = match format {
+            "paths" => format_results_paths(&results),
+            "unique_paths" => format_results_unique_paths(&results),
+            _ => {
+                let header = format!("Search results for: {query:?} (mode={mode_str})");
+                format_results(&header, &results, Some(index.symbols()))
+            }
         };
 
         Ok(json!({
@@ -699,6 +701,23 @@ impl McpServer {
                 lines.push(r.chunk.location());
             }
             lines.join("\n")
+        } else if format == "unique_paths" {
+            // Collapse defs + BM25 hits to one path per file. Defs come
+            // first since they're authoritative; BM25 hits then add any
+            // additional files where the symbol is referenced.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            let mut out: Vec<String> = Vec::new();
+            for s in &defs {
+                if seen.insert(s.file_path.as_str()) {
+                    out.push(s.file_path.clone());
+                }
+            }
+            for r in &bm25_hits {
+                if seen.insert(r.chunk.file_path.as_str()) {
+                    out.push(r.chunk.file_path.clone());
+                }
+            }
+            out.join("\n")
         } else {
             let mut lines: Vec<String> = vec![format!("References to {name:?}"), String::new()];
             if defs.is_empty() {
@@ -884,11 +903,13 @@ impl McpServer {
             }));
         }
 
-        let text = if format == "paths" {
-            format_results_paths(&results)
-        } else {
-            let header = format!("Chunks related to {file_path}:{line}");
-            format_results(&header, &results, Some(index.symbols()))
+        let text = match format {
+            "paths" => format_results_paths(&results),
+            "unique_paths" => format_results_unique_paths(&results),
+            _ => {
+                let header = format!("Chunks related to {file_path}:{line}");
+                format_results(&header, &results, Some(index.symbols()))
+            }
         };
 
         Ok(json!({
@@ -999,4 +1020,19 @@ fn format_results_paths(results: &[veles_core::types::SearchResult]) -> String {
         .map(|r| r.chunk.location())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Like [`format_results_paths`] but collapses multiple hits in the same
+/// file to a single line. Order is preserved by best-scoring hit, so the
+/// most relevant file appears first. Useful when the agent wants a
+/// shortlist of *which files* to consider, not *which chunks*.
+fn format_results_unique_paths(results: &[veles_core::types::SearchResult]) -> String {
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+    for r in results {
+        if seen.insert(r.chunk.file_path.as_str()) {
+            out.push(r.chunk.file_path.clone());
+        }
+    }
+    out.join("\n")
 }
