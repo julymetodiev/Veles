@@ -20,6 +20,10 @@ serde = { workspace = true }
 [build-dependencies]
 tonic-build = { workspace = true }
 anyhow = { workspace = true }
+# Bundles a prebuilt `protoc` for the host platform so users don't need
+# the protobuf compiler installed system-wide to `cargo install` this
+# crate. The vendored binary is set as the `PROTOC` env var in build.rs.
+protoc-bin-vendored = "3"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
