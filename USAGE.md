@@ -268,7 +268,7 @@ temp dir, indexes it in memory, and discards the clone on exit (no `.veles/`
 is persisted for remote repos).
 
 ```sh
-veles search "BM25 inverted index" https://github.com/MinishLab/semble
+veles search "BM25 inverted index" https://github.com/julymetodiev/Veles
 ```
 
 ## Multilingual content
