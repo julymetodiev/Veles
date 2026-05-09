@@ -394,6 +394,26 @@ pub async fn handle_serve_mcp() -> Result<()> {
     Ok(())
 }
 
+/// Default behaviour when no subcommand is given.
+///
+/// On an interactive terminal, print `--help` so a user who just ran
+/// `cargo install veles-cli && veles` sees what's on offer instead of a
+/// silent process that's actually waiting on JSON-RPC. When stdin is
+/// piped (e.g. an MCP client like Claude Desktop launching the binary),
+/// fall through to the MCP server — this keeps existing integrations
+/// working unchanged.
+pub async fn handle_default() -> Result<()> {
+    use std::io::IsTerminal;
+    if std::io::stdin().is_terminal() {
+        let mut cmd = Cli::command();
+        cmd.print_help()?;
+        println!();
+        Ok(())
+    } else {
+        handle_serve_mcp().await
+    }
+}
+
 pub fn handle_completions(shell: Shell) -> Result<()> {
     let mut cmd = Cli::command();
     let bin_name = cmd.get_name().to_string();
