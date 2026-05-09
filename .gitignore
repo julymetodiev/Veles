@@ -47,4 +47,5 @@ export-*
 settings.local.json
 .claude/settings.local.json
 .veles
+.mcp.json
 CLAUDE.md
