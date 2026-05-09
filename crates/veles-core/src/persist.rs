@@ -40,10 +40,13 @@ const BM25_FILE: &str = "bm25.bin";
 const DENSE_FILE: &str = "dense.bin";
 const SYMBOLS_FILE: &str = "symbols.bin";
 
-/// Cheap fingerprint for change detection — size + mtime is fast and covers
-/// almost all real edits. Content hashing can be added later if needed.
+/// Cheap fingerprint for change detection.
+///
+/// `(size, mtime)` is fast to compute and covers almost all real edits;
+/// content hashing can be layered on later if needed.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileFingerprint {
+    /// File size in bytes.
     pub size: u64,
     /// Modification time as Unix epoch seconds.
     pub mtime_secs: i64,
@@ -70,19 +73,30 @@ impl FileFingerprint {
     }
 }
 
-/// Index manifest — small JSON describing the index. Kept human-readable so
-/// users can inspect `.veles/manifest.json` to debug staleness.
+/// Small JSON sidecar describing a persisted index.
+///
+/// Human-readable on purpose so users can `cat .veles/manifest.json` to
+/// debug staleness or model mismatches.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
+    /// Version of `veles` that wrote this index (from `CARGO_PKG_VERSION`).
     pub veles_version: String,
+    /// On-disk format version. Bumped on incompatible layout changes; a
+    /// mismatch on `load` forces a `veles index --force`.
     pub format_version: u32,
+    /// Embedding model used at build time (e.g. `"minishlab/potion-code-16M"`).
+    /// Loading with a different model is rejected.
     pub model_name: String,
+    /// Dimensionality of the dense vectors.
     pub embedding_dim: usize,
+    /// Whether text/document files (markdown, yaml, ...) were indexed
+    /// alongside source code.
     pub include_text_files: bool,
     /// Unix epoch seconds when the index was last written.
     pub indexed_at: i64,
-    /// File path (relative to repo root) → fingerprint.
+    /// Per-file fingerprints used by incremental update.
     pub files: BTreeMap<String, FileFingerprint>,
+    /// Total chunks across all files.
     pub total_chunks: usize,
 }
 
@@ -246,18 +260,26 @@ fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     Ok(value)
 }
 
-/// Outcome of an incremental update.
+/// Outcome of an incremental update — returned by
+/// [`crate::VelesIndex::update_from_path`].
 #[derive(Debug, Default, Clone)]
 pub struct UpdateReport {
+    /// Files seen on disk that weren't in the previous manifest.
     pub added_files: usize,
+    /// Files whose `(size, mtime)` fingerprint changed.
     pub modified_files: usize,
+    /// Files in the previous manifest no longer present on disk.
     pub removed_files: usize,
+    /// Chunks reused from the previous index without re-embedding.
     pub kept_chunks: usize,
+    /// Chunks freshly embedded for added/modified files.
     pub new_chunks: usize,
+    /// Total chunks in the updated index (`kept + new`).
     pub total_chunks: usize,
 }
 
 impl UpdateReport {
+    /// True when no files were added, modified, or removed.
     pub fn is_noop(&self) -> bool {
         self.added_files == 0 && self.modified_files == 0 && self.removed_files == 0
     }

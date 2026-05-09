@@ -105,10 +105,10 @@ pub fn extract_symbols(content: &str, file_path: &str, language: &str) -> Vec<Sy
 
     let source_bytes = content.as_bytes();
     let mut cursor = QueryCursor::new();
-    let mut iter = cursor.matches(&query, tree.root_node(), source_bytes);
+    let iter = cursor.matches(&query, tree.root_node(), source_bytes);
     let mut out: Vec<Symbol> = Vec::new();
 
-    while let Some(m) = iter.next() {
+    for m in iter {
         let pattern = m.pattern_index;
         let kind = match cfg.kinds.get(pattern) {
             Some(Some(k)) => *k,

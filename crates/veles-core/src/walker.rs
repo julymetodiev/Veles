@@ -385,10 +385,10 @@ pub fn walk_files<'a>(
 
             // Check file size before materialising the PathBuf — saves an alloc
             // when oversized files are filtered out.
-            if let Ok(metadata) = entry.metadata() {
-                if metadata.len() > MAX_FILE_BYTES {
-                    return None;
-                }
+            if let Ok(metadata) = entry.metadata()
+                && metadata.len() > MAX_FILE_BYTES
+            {
+                return None;
             }
             Some(path.to_path_buf())
         })

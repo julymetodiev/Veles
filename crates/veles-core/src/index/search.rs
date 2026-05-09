@@ -70,6 +70,7 @@ pub fn search_bm25(
 }
 
 /// Hybrid search: alpha-weighted combination of semantic and BM25 scores after RRF.
+#[allow(clippy::too_many_arguments)]
 pub fn search_hybrid(
     query: &str,
     model: &model2vec_rs::model::StaticModel,
@@ -92,7 +93,7 @@ pub fn search_hybrid(
     let (sem_idx, sem_sim) = dense_index.query(&query_emb[0], candidate_count, selector);
     let sem_topk: Vec<(usize, f64)> = sem_idx
         .into_iter()
-        .zip(sem_sim.into_iter())
+        .zip(sem_sim)
         .map(|(i, s)| (i, s as f64))
         .collect();
 

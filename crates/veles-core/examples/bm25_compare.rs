@@ -101,18 +101,17 @@ fn collect_docs(root: &Path) -> Vec<Vec<String>> {
             for entry in rd.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-                        if name.starts_with('.')
+                    if let Some(name) = path.file_name().and_then(|s| s.to_str())
+                        && (name.starts_with('.')
                             || name == "node_modules"
                             || name == "target"
                             || name == "dist"
                             || name == "build"
                             || name == "__pycache__"
                             || name == "venv"
-                            || name == ".venv"
-                        {
-                            continue;
-                        }
+                            || name == ".venv")
+                    {
+                        continue;
                     }
                     stack.push(path);
                 } else if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
@@ -123,10 +122,10 @@ fn collect_docs(root: &Path) -> Vec<Vec<String>> {
                     if !ok {
                         continue;
                     }
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        if meta.len() > 1_000_000 {
-                            continue;
-                        }
+                    if let Ok(meta) = std::fs::metadata(&path)
+                        && meta.len() > 1_000_000
+                    {
+                        continue;
                     }
                     if let Ok(text) = std::fs::read_to_string(&path) {
                         // Chunk into 50-line blocks (loose match for benchmark purposes).

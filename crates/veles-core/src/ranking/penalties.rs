@@ -70,7 +70,7 @@ pub fn rerank_topk(
     let mut penalised: Vec<f64> = Vec::with_capacity(scores.len());
 
     for (i, &score) in scores.iter().enumerate() {
-        if !(score > 0.0) {
+        if score <= 0.0 || score.is_nan() {
             penalised.push(0.0);
             continue;
         }

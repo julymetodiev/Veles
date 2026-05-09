@@ -1,7 +1,42 @@
-//! MCP (Model Context Protocol) server for Veles code search.
+//! `veles-mcp` — Model Context Protocol server for [Veles] code search.
 //!
-//! Implements JSON-RPC 2.0 over stdio for AI agent integration.
-//! Exposes `search` and `find_related` tools.
+//! Speaks JSON-RPC 2.0 over stdio so AI agents (Claude Desktop, Cursor,
+//! anything else MCP-aware) can search a codebase without leaving their
+//! tool-call loop. Indexes are cached in process across calls, so
+//! repeat queries against the same repo skip the re-index cost.
+//!
+//! # Tools exposed to the agent
+//!
+//! - `search` — natural-language or code query against a local
+//!   directory or `https://` git URL.
+//! - `find_related` — semantically similar chunks for a `(file, line)`
+//!   pair returned by an earlier `search`.
+//!
+//! The supported transport is line-delimited JSON-RPC on stdin/stdout
+//! per the [MCP 2024-11-05] revision, with `tools/list` and
+//! `tools/call` as the only entry points beyond `initialize`.
+//!
+//! # Running the server
+//!
+//! From code:
+//!
+//! ```no_run
+//! # async fn run() -> anyhow::Result<()> {
+//! let model = veles_core::model::load_model(None)?;
+//! veles_mcp::McpServer::new(model).run().await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From the CLI (the default if no subcommand is given):
+//!
+//! ```sh
+//! veles serve-mcp
+//! veles            # equivalent — bare `veles` starts MCP on a piped stdin
+//! ```
+//!
+//! [Veles]: https://github.com/julymetodiev/Veles
+//! [MCP 2024-11-05]: https://modelcontextprotocol.io/specification/2024-11-05
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, Write};

@@ -68,14 +68,14 @@ pub fn top_k_indexed(scores: &[f64], k: usize) -> Vec<(usize, f64)> {
                 idx: i as u32,
                 score: s,
             });
-        } else if let Some(top) = heap.peek() {
-            if s > top.score {
-                heap.pop();
-                heap.push(MinEntry {
-                    idx: i as u32,
-                    score: s,
-                });
-            }
+        } else if let Some(top) = heap.peek()
+            && s > top.score
+        {
+            heap.pop();
+            heap.push(MinEntry {
+                idx: i as u32,
+                score: s,
+            });
         }
     }
 
@@ -104,14 +104,14 @@ where
                 idx: i as u32,
                 score: s,
             });
-        } else if let Some(top) = heap.peek() {
-            if s > top.score {
-                heap.pop();
-                heap.push(MinEntryF32 {
-                    idx: i as u32,
-                    score: s,
-                });
-            }
+        } else if let Some(top) = heap.peek()
+            && s > top.score
+        {
+            heap.pop();
+            heap.push(MinEntryF32 {
+                idx: i as u32,
+                score: s,
+            });
         }
     }
     let mut out: Vec<(usize, f32)> = heap

@@ -117,7 +117,7 @@ pub fn apply_query_boost(scores: &mut [f64], query: &str, chunks: &[Chunk]) {
         return;
     }
     let max_score = current_max(scores);
-    if !(max_score > 0.0) {
+    if max_score <= 0.0 || max_score.is_nan() {
         return;
     }
 
@@ -132,7 +132,7 @@ pub fn apply_query_boost(scores: &mut [f64], query: &str, chunks: &[Chunk]) {
 /// Promote files with multiple high-scoring chunks by boosting their top chunk in place.
 pub fn boost_multi_chunk_files(scores: &mut [f64], chunks: &[Chunk]) {
     let max_score = current_max(scores);
-    if !(max_score > 0.0) {
+    if max_score <= 0.0 || max_score.is_nan() {
         return;
     }
 
@@ -141,7 +141,7 @@ pub fn boost_multi_chunk_files(scores: &mut [f64], chunks: &[Chunk]) {
     let mut best_idx: AHashMap<&str, (usize, f64)> = AHashMap::new();
 
     for (i, &score) in scores.iter().enumerate() {
-        if !(score > 0.0) {
+        if score <= 0.0 || score.is_nan() {
             continue;
         }
         let fp = chunks[i].file_path.as_str();
@@ -153,7 +153,7 @@ pub fn boost_multi_chunk_files(scores: &mut [f64], chunks: &[Chunk]) {
     }
 
     let max_file_sum = file_sum.values().copied().fold(f64::NEG_INFINITY, f64::max);
-    if !(max_file_sum > 0.0) {
+    if max_file_sum <= 0.0 || max_file_sum.is_nan() {
         return;
     }
     let boost_unit = max_score * FILE_COHERENCE_BOOST_FRAC;
@@ -361,7 +361,7 @@ fn boost_stem_matches(scores: &mut [f64], query: &str, max_score: f64, chunks: &
     let mut path_cache: AHashMap<&str, AHashSet<String>> = AHashMap::new();
 
     for (i, chunk) in chunks.iter().enumerate() {
-        if !(scores[i] > 0.0) {
+        if scores[i] <= 0.0 || scores[i].is_nan() {
             continue;
         }
         let parts = path_cache
@@ -388,10 +388,9 @@ fn build_path_parts(file_path: &str) -> AHashSet<String> {
         .parent()
         .and_then(|p| p.file_name())
         .and_then(|n| n.to_str())
+        && ![".", "/", ".."].contains(&parent_name)
     {
-        if ![".", "/", ".."].contains(&parent_name) {
-            parts.extend(split_identifier(parent_name));
-        }
+        parts.extend(split_identifier(parent_name));
     }
     parts
 }

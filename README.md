@@ -4,6 +4,11 @@
 
 # Veles
 
+[![Crates.io](https://img.shields.io/crates/v/veles-cli.svg?label=veles-cli)](https://crates.io/crates/veles-cli)
+[![Crates.io](https://img.shields.io/crates/v/veles-core.svg?label=veles-core)](https://crates.io/crates/veles-core)
+[![docs.rs](https://docs.rs/veles-core/badge.svg)](https://docs.rs/veles-core)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+
 Fast, hybrid (BM25 + semantic) local code search for AI agents and humans, written in pure Rust.
 
 Veles runs entirely on CPU — no GPU, no transformer forward pass at query time. Queries return in tens of milliseconds against a persistent on-disk index, with tree-sitter-aware symbol lookups, pipe-friendly output formats, and built-in MCP / gRPC servers for integration with Claude, Cursor, or anything else that speaks JSON-RPC. Static embeddings come from the [potion](https://huggingface.co/minishlab) family via [model2vec-rs](https://github.com/MinishLab/model2vec-rs).
@@ -185,6 +190,36 @@ cargo build --release
 ```
 
 `tonic-build` ships a vendored `protoc` via `protoc-bin-vendored`, so no system-wide protobuf compiler is required.
+
+## Embedding in your own Rust project
+
+The workspace publishes four crates on crates.io — pick the layer you need:
+
+| Crate | Purpose |
+|-------|---------|
+| [`veles-core`](https://crates.io/crates/veles-core) | Indexing, chunking, BM25, dense search, hybrid ranking, persistence. |
+| [`veles-grpc`](https://crates.io/crates/veles-grpc) | tonic-based gRPC service wrapping `veles-core`. |
+| [`veles-mcp`](https://crates.io/crates/veles-mcp)   | MCP / JSON-RPC server (stdio) for AI-agent integration. |
+| [`veles-cli`](https://crates.io/crates/veles-cli)   | The `veles` binary. |
+
+Full API docs are on [docs.rs](https://docs.rs/veles-core).
+
+```toml
+[dependencies]
+veles-core = "0.2"
+```
+
+```rust
+use std::path::Path;
+use veles_core::{SearchMode, VelesIndex};
+
+let index = VelesIndex::from_path(Path::new("."), None, None, false)?;
+let results = index.search("parse config", 5, SearchMode::Hybrid, None, None, None);
+for r in results {
+    println!("{} [{:.3}]", r.chunk.location(), r.score);
+}
+# Ok::<(), anyhow::Error>(())
+```
 
 ## Architecture
 

@@ -1,7 +1,38 @@
-//! gRPC service for Veles code search.
+//! `veles-grpc` — [tonic]-based gRPC service for [Veles] code search.
 //!
-//! Exposes `Index`, `Search`, `FindRelated`, and `GetStats` RPCs backed by
-//! an in-memory cache of `VelesIndex` instances.
+//! Wraps [`veles_core::VelesIndex`] in a small process-local cache of
+//! indexes (one per `repo`) and exposes the search surface over gRPC.
+//!
+//! # RPCs
+//!
+//! - `Index` — build / refresh an index for a repo path or git URL.
+//! - `Search` — hybrid / BM25 / semantic search.
+//! - `FindRelated` — semantically similar chunks for a `(file, line)`.
+//! - `GetStats` — index size and per-language counts.
+//!
+//! The on-the-wire schema lives in `proto/veles.proto`. Generated
+//! types are re-exported under [`proto`].
+//!
+//! # Running the server
+//!
+//! From code:
+//!
+//! ```no_run
+//! # async fn run() -> anyhow::Result<()> {
+//! let model = veles_core::model::load_model(None)?;
+//! veles_grpc::serve("[::1]:50051", model).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! From the CLI:
+//!
+//! ```sh
+//! veles serve-grpc --addr "[::1]:50051"
+//! ```
+//!
+//! [Veles]: https://github.com/julymetodiev/Veles
+//! [tonic]: https://github.com/hyperium/tonic
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -47,10 +78,10 @@ impl IndexCache {
         }
 
         // Evict first entry if at capacity.
-        if self.indexes.len() >= self.max_size {
-            if let Some(key) = self.indexes.keys().next().cloned() {
-                self.indexes.remove(&key);
-            }
+        if self.indexes.len() >= self.max_size
+            && let Some(key) = self.indexes.keys().next().cloned()
+        {
+            self.indexes.remove(&key);
         }
 
         let repo_owned = repo.to_string();
@@ -62,9 +93,7 @@ impl IndexCache {
         } else if repo.starts_with("https://") || repo.starts_with("http://") {
             VelesIndex::from_git(repo, None, Some(model), include_text_files)
         } else {
-            return Err(format!(
-                "Invalid repo: must be a local directory or https:// URL"
-            ));
+            return Err("Invalid repo: must be a local directory or https:// URL".to_string());
         }
         .map_err(|e| format!("Failed to index {repo}: {e}"))?;
 

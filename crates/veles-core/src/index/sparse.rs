@@ -151,10 +151,10 @@ impl Bm25Index {
         // already accounting for it, so we union the postings).
         let mut term_ids: Vec<u32> = Vec::with_capacity(query_tokens.len());
         for tok in query_tokens {
-            if let Some(&id) = self.vocab.get(tok.as_str()) {
-                if !term_ids.contains(&id) {
-                    term_ids.push(id);
-                }
+            if let Some(&id) = self.vocab.get(tok.as_str())
+                && !term_ids.contains(&id)
+            {
+                term_ids.push(id);
             }
         }
         if term_ids.is_empty() {
@@ -171,10 +171,10 @@ impl Bm25Index {
             let idf_val = self.idf[tid as usize];
             for posting in &self.postings[tid as usize] {
                 let doc_idx = posting.doc as usize;
-                if let Some(m) = &mask {
-                    if !m[doc_idx] {
-                        continue;
-                    }
+                if let Some(m) = &mask
+                    && !m[doc_idx]
+                {
+                    continue;
                 }
                 let tf_val = posting.tf as f64;
                 let dl = self.doc_lengths[doc_idx] as f64;

@@ -1,6 +1,6 @@
 //! One handler function per subcommand.
 //!
-//! Each `handle_*` takes the destructured arguments from its [`Commands`]
+//! Each `handle_*` takes the destructured arguments from its `Commands`
 //! variant and returns `anyhow::Result<()>`. Handlers may print to stdout
 //! and may call `std::process::exit` for hard failures whose error
 //! semantics differ from `anyhow::Error` (e.g. "no chunk at file:line").
