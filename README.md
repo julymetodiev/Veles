@@ -181,7 +181,17 @@ veles serve-mcp     # explicit
 veles               # equivalent — bare `veles` starts MCP when stdin is piped
 ```
 
-Exposed tools: `search`, `find_related`.
+Exposed tools:
+
+| Tool           | Use it for                                                                            |
+|----------------|---------------------------------------------------------------------------------------|
+| `search`       | Hybrid / BM25 / semantic query, with optional `lang` / `path` / `exclude` / `min_score`. |
+| `defs`         | Tree-sitter definitions for an exact symbol name (Rust, Python, JS, TS, Go).          |
+| `symbols`      | Outline of a single file — every definition it contains.                              |
+| `refs`         | Definitions plus BM25 hits — "where is X defined and where is X used", in one call.   |
+| `stats`        | File / chunk counts, model metadata, per-language chunk breakdown.                    |
+| `update`       | Incremental refresh of a local repo's `.veles/` index after edits.                    |
+| `find_related` | Semantically similar chunks for a `(file_path, line)` from an earlier `search`.       |
 
 ## Build from source
 

@@ -15,14 +15,17 @@ the same repo skip the re-index cost.
 
 ## Tools exposed to the agent
 
-| Tool          | Use it for                                                      |
-|---------------|-----------------------------------------------------------------|
-| `search`      | Natural-language or code query against a repo (hybrid by default). |
-| `find_related`| Semantically similar chunks for a `(file_path, line)` from an earlier `search`. |
+| Tool           | Use it for                                                                                  |
+|----------------|---------------------------------------------------------------------------------------------|
+| `search`       | Natural-language or code query against a repo (hybrid by default). Optional `lang` / `path` / `exclude` glob filters and a `min_score` threshold narrow noisy queries. |
+| `defs`         | Every tree-sitter definition with the given name (Rust, Python, JavaScript, TypeScript, Go). More precise than `search` when you already know the symbol name. |
+| `symbols`      | The tree-sitter outline of a single file — a cheap alternative to reading the whole file when only the structure matters. |
+| `refs`         | Definitions plus BM25 hits for a symbol name. One call to answer both "where is X defined" and "where is X used". |
+| `stats`        | What the index knows about a repo: file count, chunk count, model metadata, per-language breakdown. |
+| `update`       | Incrementally refresh a local repo's `.veles/` index against the current state of disk. |
+| `find_related` | Semantically similar chunks for a `(file_path, line)` from an earlier `search`.             |
 
-The `repo` argument may be a local directory path **or** an `https://`
-git URL. Remote repos are shallow-cloned into a temp directory the
-first time they're searched, then cached in-process.
+The `repo` argument (defaults to `.`) may be a local directory path **or** an `https://` git URL. Remote repos are shallow-cloned into a temp directory the first time they're searched, then cached in-process. `update` is local-only — re-running `search` against an https:// URL re-clones it.
 
 ## Run the server
 

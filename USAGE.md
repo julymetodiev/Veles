@@ -405,8 +405,12 @@ veles                          # equivalent
 veles serve-grpc --addr "[::1]:50051"
 ```
 
-The MCP server exposes `search` and `find_related` as tools. See
-`crates/veles-mcp/src/lib.rs` for the JSON-RPC schema.
+The MCP server exposes `search`, `defs`, `symbols`, `refs`, `stats`,
+`update`, and `find_related` as tools. `search` accepts the same
+`lang` / `path` / `exclude` / `min_score` filters as the CLI. See
+`crates/veles-mcp/src/lib.rs` for the JSON-RPC schema and
+[`crates/veles-mcp/README.md`](crates/veles-mcp/README.md) for a
+short description of each tool.
 
 ## Shell completions and man page
 
