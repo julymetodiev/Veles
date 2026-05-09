@@ -10,15 +10,20 @@
 //! - `serve-grpc` — Start a gRPC server
 //! - `serve-mcp` — Start an MCP server (default if no subcommand)
 
+mod format;
+
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use globset::{Glob, GlobSet, GlobSetBuilder};
 
 use veles_core::VelesIndex;
 use veles_core::model;
 use veles_core::persist;
-use veles_core::types::SearchMode;
+use veles_core::types::{SearchMode, SearchResult};
+
+use crate::format::OutputFormat;
 
 #[derive(Parser)]
 #[command(name = "veles")]
@@ -44,6 +49,21 @@ enum Commands {
         /// Search mode.
         #[arg(short, long, default_value = "hybrid")]
         mode: String,
+        /// Output format: pretty (default), compact, ripgrep, paths, json, jsonl.
+        #[arg(short, long, default_value = "pretty")]
+        format: String,
+        /// Restrict to specific languages (comma-separated, e.g. `rust,python`).
+        #[arg(short = 'l', long, value_delimiter = ',')]
+        lang: Vec<String>,
+        /// Glob pattern of paths to include (repeatable, e.g. `--path 'src/**/*.rs'`).
+        #[arg(short = 'g', long = "path", value_name = "GLOB")]
+        path_glob: Vec<String>,
+        /// Glob pattern of paths to exclude (repeatable, e.g. `--exclude 'tests/**'`).
+        #[arg(short = 'x', long = "exclude", value_name = "GLOB")]
+        exclude_glob: Vec<String>,
+        /// Drop results scoring below this threshold.
+        #[arg(long)]
+        min_score: Option<f64>,
         /// Also index non-code text files.
         #[arg(long)]
         include_text_files: bool,
@@ -69,6 +89,12 @@ enum Commands {
         /// Number of similar chunks to return.
         #[arg(short, long, default_value = "5")]
         top_k: usize,
+        /// Output format: pretty (default), compact, ripgrep, paths, json, jsonl.
+        #[arg(short, long, default_value = "pretty")]
+        format: String,
+        /// Drop results scoring below this threshold.
+        #[arg(long)]
+        min_score: Option<f64>,
         /// Also index non-code text files.
         #[arg(long)]
         include_text_files: bool,
@@ -156,20 +182,39 @@ async fn main() -> Result<()> {
             path,
             top_k,
             mode,
+            format: format_str,
+            lang,
+            path_glob,
+            exclude_glob,
+            min_score,
             include_text_files,
             multilingual,
             no_cache,
         }) => {
+            let format: OutputFormat = format_str
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
             let index = open_index(&path, multilingual, include_text_files, !no_cache)?;
             let search_mode = mode.parse::<SearchMode>().unwrap_or(SearchMode::Hybrid);
-            let results = index.search(&query, top_k, search_mode, None, None, None);
 
-            if results.is_empty() {
-                println!("No results found.");
-            } else {
-                let header = format!("Search results for: {query:?} (mode={mode})");
-                println!("{}", format_results(&header, &results));
+            let glob_paths =
+                resolve_path_filter(&index, &path_glob, &exclude_glob)?;
+            let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
+            let path_slice: Option<&[String]> = glob_paths.as_deref();
+
+            let mut results =
+                index.search(&query, top_k, search_mode, None, lang_slice, path_slice);
+
+            if let Some(threshold) = min_score {
+                results.retain(|r| r.score >= threshold);
             }
+
+            emit_results(
+                format,
+                &format!("Search results for: {query:?} (mode={mode})"),
+                "results",
+                &results,
+            );
         }
 
         Some(Commands::FindRelated {
@@ -177,10 +222,15 @@ async fn main() -> Result<()> {
             line,
             path,
             top_k,
+            format: format_str,
+            min_score,
             include_text_files,
             multilingual,
             no_cache,
         }) => {
+            let format: OutputFormat = format_str
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
             let index = open_index(&path, multilingual, include_text_files, !no_cache)?;
 
             let chunk = match index.resolve_chunk(&file_path, line) {
@@ -191,13 +241,17 @@ async fn main() -> Result<()> {
                 }
             };
 
-            let results = index.find_related(&chunk, top_k);
-            if results.is_empty() {
-                println!("No related chunks found for {file_path}:{line}.");
-            } else {
-                let header = format!("Chunks related to {file_path}:{line}");
-                println!("{}", format_results(&header, &results));
+            let mut results = index.find_related(&chunk, top_k);
+            if let Some(threshold) = min_score {
+                results.retain(|r| r.score >= threshold);
             }
+
+            emit_results(
+                format,
+                &format!("Chunks related to {file_path}:{line}"),
+                "related chunks",
+                &results,
+            );
         }
 
         Some(Commands::Index {
@@ -409,22 +463,84 @@ fn load_model(multilingual: bool) -> Result<model::StaticModel> {
     }
 }
 
-/// Format search results as numbered, fenced code blocks.
-fn format_results(header: &str, results: &[veles_core::types::SearchResult]) -> String {
-    let mut lines: Vec<String> = vec![header.to_string(), String::new()];
-    for (i, r) in results.iter().enumerate() {
-        lines.push(format!(
-            "## {}. {}  [score={:.3}]",
-            i + 1,
-            r.chunk.location(),
-            r.score
-        ));
-        lines.push("```".to_string());
-        lines.push(r.chunk.content.trim().to_string());
-        lines.push("```".to_string());
-        lines.push(String::new());
+/// Render results in the chosen format and write to stdout.
+fn emit_results(
+    format: OutputFormat,
+    header: &str,
+    what: &str,
+    results: &[SearchResult],
+) {
+    if results.is_empty() {
+        let msg = format::empty_message(format, what);
+        if !msg.is_empty() {
+            println!("{msg}");
+        }
+        return;
     }
-    lines.join("\n")
+    let rendered = format::render(format, header, results);
+    // `render_pretty` produces a trailing newline naturally via its joined
+    // lines; line-oriented formats also self-terminate. Use `print!` so we
+    // don't double up.
+    if rendered.ends_with('\n') {
+        print!("{rendered}");
+    } else {
+        println!("{rendered}");
+    }
+}
+
+/// Build a list of file paths matching the include/exclude globs.
+///
+/// Returns `None` when no globs are supplied (caller should pass
+/// `None` for `filter_paths` so the search is unrestricted).
+fn resolve_path_filter(
+    index: &VelesIndex,
+    include: &[String],
+    exclude: &[String],
+) -> Result<Option<Vec<String>>> {
+    if include.is_empty() && exclude.is_empty() {
+        return Ok(None);
+    }
+
+    let include_set = build_globset(include).context("invalid --path glob")?;
+    let exclude_set = build_globset(exclude).context("invalid --exclude glob")?;
+
+    // Collect unique file paths from the index, then filter.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut matched: Vec<String> = Vec::new();
+    for chunk in index.chunks() {
+        if !seen.insert(chunk.file_path.as_str()) {
+            continue;
+        }
+        let p = chunk.file_path.as_str();
+        let included = match &include_set {
+            Some(s) => s.is_match(p),
+            None => true,
+        };
+        let excluded = match &exclude_set {
+            Some(s) => s.is_match(p),
+            None => false,
+        };
+        if included && !excluded {
+            matched.push(p.to_string());
+        }
+    }
+
+    if matched.is_empty() {
+        bail!("No indexed files matched the given --path / --exclude globs");
+    }
+    Ok(Some(matched))
+}
+
+fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = GlobSetBuilder::new();
+    for p in patterns {
+        let glob = Glob::new(p).with_context(|| format!("bad glob pattern {p:?}"))?;
+        builder.add(glob);
+    }
+    Ok(Some(builder.build()?))
 }
 
 /// Check if a path looks like a git URL.
