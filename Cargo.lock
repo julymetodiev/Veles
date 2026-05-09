@@ -2421,7 +2421,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "veles-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2440,7 +2440,7 @@ dependencies = [
 
 [[package]]
 name = "veles-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ahash",
  "anyhow",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "veles-grpc"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "model2vec-rs",
@@ -2481,7 +2481,7 @@ dependencies = [
 
 [[package]]
 name = "veles-mcp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "model2vec-rs",
