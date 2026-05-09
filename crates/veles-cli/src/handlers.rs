@@ -15,7 +15,7 @@ use veles_core::VelesIndex;
 use veles_core::model;
 use veles_core::persist;
 use veles_core::symbols::Symbol;
-use veles_core::types::SearchMode;
+use veles_core::types::{SearchMode, SearchResult};
 
 use crate::cli::Cli;
 use crate::format::{self, OutputFormat};
@@ -56,6 +56,7 @@ pub fn handle_search(
         &format!("Search results for: {query:?} (mode={mode})"),
         "results",
         &results,
+        Some(index.symbols()),
     );
     Ok(())
 }
@@ -67,6 +68,9 @@ pub fn handle_find_related(
     path: String,
     top_k: usize,
     format_str: String,
+    lang: Vec<String>,
+    path_glob: Vec<String>,
+    exclude_glob: Vec<String>,
     min_score: Option<f64>,
     include_text_files: bool,
     multilingual: bool,
@@ -83,7 +87,11 @@ pub fn handle_find_related(
         }
     };
 
-    let mut results = index.find_related(&chunk, top_k, None, None);
+    let glob_paths = resolve_path_filter(&index, &path_glob, &exclude_glob)?;
+    let lang_slice: Option<&[String]> = if lang.is_empty() { None } else { Some(&lang) };
+    let path_slice: Option<&[String]> = glob_paths.as_deref();
+
+    let mut results = index.find_related(&chunk, top_k, lang_slice, path_slice);
     if let Some(threshold) = min_score {
         results.retain(|r| r.score >= threshold);
     }
@@ -93,6 +101,7 @@ pub fn handle_find_related(
         &format!("Chunks related to {file_path}:{line}"),
         "related chunks",
         &results,
+        Some(index.symbols()),
     );
     Ok(())
 }
@@ -321,7 +330,23 @@ pub fn handle_refs(
     let index = open_index(&path, multilingual, false, true)?;
 
     let defs: Vec<&Symbol> = index.symbols().iter().filter(|s| s.name == name).collect();
-    let bm25_hits = index.search(&name, top_k, SearchMode::Bm25, None, None, None);
+
+    // Pull a few extra BM25 hits so dropping chunks that overlap a
+    // definition site still leaves the caller with roughly the requested
+    // count.
+    let bm25_overshoot = top_k + (top_k / 2).max(1);
+    let bm25_hits: Vec<SearchResult> = index
+        .search(&name, bm25_overshoot, SearchMode::Bm25, None, None, None)
+        .into_iter()
+        .filter(|hit| {
+            !defs.iter().any(|d| {
+                d.file_path == hit.chunk.file_path
+                    && d.start_line >= hit.chunk.start_line
+                    && d.start_line <= hit.chunk.end_line
+            })
+        })
+        .take(top_k)
+        .collect();
 
     match format {
         OutputFormat::Pretty => {
@@ -349,6 +374,7 @@ pub fn handle_refs(
                     OutputFormat::Pretty,
                     &format!("{} BM25 result(s)", bm25_hits.len()),
                     &bm25_hits,
+                    Some(index.symbols()),
                 );
                 println!("{rendered}");
             }
@@ -361,8 +387,12 @@ pub fn handle_refs(
                 write_or_fall_through(&rendered);
             }
             if !bm25_hits.is_empty() {
-                let rendered =
-                    format::render(format, &format!("BM25 hits for {name:?}"), &bm25_hits);
+                let rendered = format::render(
+                    format,
+                    &format!("BM25 hits for {name:?}"),
+                    &bm25_hits,
+                    Some(index.symbols()),
+                );
                 write_or_fall_through(&rendered);
             }
             if defs.is_empty() && bm25_hits.is_empty() {

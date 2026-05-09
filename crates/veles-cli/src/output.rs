@@ -9,12 +9,22 @@ use veles_core::types::SearchResult;
 use crate::format::{self, OutputFormat};
 
 /// Render search results in the chosen format and write to stdout.
-pub fn emit_results(format: OutputFormat, header: &str, what: &str, results: &[SearchResult]) {
+///
+/// `symbols`, when supplied, lets the `pretty` and `compact` formats
+/// append a scope label per hit. Pass `None` for renderers that don't
+/// have access to the index's symbol table.
+pub fn emit_results(
+    format: OutputFormat,
+    header: &str,
+    what: &str,
+    results: &[SearchResult],
+    symbols: Option<&[Symbol]>,
+) {
     if results.is_empty() {
         emit_empty(format, what);
         return;
     }
-    let rendered = format::render(format, header, results);
+    let rendered = format::render(format, header, results, symbols);
     write_rendered(rendered);
 }
 

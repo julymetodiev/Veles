@@ -948,40 +948,9 @@ fn format_symbols(header: &str, symbols: &[&Symbol]) -> String {
     lines.join("\n")
 }
 
-/// Pick a short scope label for a chunk so an agent can route on the
-/// result header without reading the body.
-///
-/// Two-tier heuristic:
-/// 1. If any symbols *start* inside the chunk, the chunk is showing
-///    those definitions — return ``defines `name` ``.
-/// 2. Else find the most specific symbol whose range strictly contains
-///    `chunk.start_line` (the chunk is mid-body) — return ``in `name` ``.
-///
-/// Returns `None` for chunks that neither define nor live inside any
-/// tree-sitter-recognised symbol (typical for module-level prelude
-/// before the first definition, or files in unsupported languages).
-fn chunk_scope_label(
-    symbols: &[veles_core::symbols::Symbol],
-    chunk: &veles_core::types::Chunk,
-) -> Option<String> {
-    let same_file = || symbols.iter().filter(|s| s.file_path == chunk.file_path);
-
-    let defined: Vec<&veles_core::symbols::Symbol> = same_file()
-        .filter(|s| s.start_line >= chunk.start_line && s.start_line <= chunk.end_line)
-        .collect();
-    if let Some(first) = defined.first() {
-        return Some(if defined.len() == 1 {
-            format!("defines `{}`", first.name)
-        } else {
-            format!("defines `{}` (+{} more)", first.name, defined.len() - 1)
-        });
-    }
-
-    same_file()
-        .filter(|s| s.start_line < chunk.start_line && chunk.start_line <= s.end_line)
-        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
-        .map(|s| format!("in `{}`", s.name))
-}
+// Scope-label heuristic lives in `veles_core::scope` so the CLI and MCP
+// share exactly the same policy. Re-import locally for the formatter.
+use veles_core::scope::chunk_scope_label;
 
 /// Format search results as numbered, fenced code blocks. When `symbols`
 /// is `Some`, each header is suffixed with a scope label (e.g.

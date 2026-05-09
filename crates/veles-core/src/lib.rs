@@ -100,6 +100,7 @@ pub mod index;
 pub mod model;
 pub mod persist;
 pub mod ranking;
+pub mod scope;
 pub mod symbols;
 pub mod tokenizer;
 pub mod types;

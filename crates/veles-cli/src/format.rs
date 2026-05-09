@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use serde::Serialize;
+use veles_core::scope::chunk_scope_label;
 use veles_core::symbols::Symbol;
 use veles_core::types::SearchResult;
 
@@ -46,10 +47,19 @@ impl FromStr for OutputFormat {
 }
 
 /// Render results in the requested format.
-pub fn render(format: OutputFormat, header: &str, results: &[SearchResult]) -> String {
+///
+/// `symbols`, when supplied, enriches the `pretty` and `compact` headers
+/// with a scope label per hit (e.g. ``defines `Foo``` or ``in `bar```).
+/// All other formats ignore it.
+pub fn render(
+    format: OutputFormat,
+    header: &str,
+    results: &[SearchResult],
+    symbols: Option<&[Symbol]>,
+) -> String {
     match format {
-        OutputFormat::Pretty => render_pretty(header, results),
-        OutputFormat::Compact => render_compact(results),
+        OutputFormat::Pretty => render_pretty(header, results, symbols),
+        OutputFormat::Compact => render_compact(results, symbols),
         OutputFormat::Ripgrep => render_ripgrep(results),
         OutputFormat::Paths => render_paths(results),
         OutputFormat::Json => render_json(header, results, false),
@@ -71,14 +81,18 @@ pub fn empty_message(format: OutputFormat, what: &str) -> String {
 
 // ── Renderers ────────────────────────────────────────────────────────────
 
-fn render_pretty(header: &str, results: &[SearchResult]) -> String {
+fn render_pretty(header: &str, results: &[SearchResult], symbols: Option<&[Symbol]>) -> String {
     let mut lines: Vec<String> = vec![header.to_string(), String::new()];
     for (i, r) in results.iter().enumerate() {
+        let scope_suffix = symbols
+            .and_then(|syms| chunk_scope_label(syms, &r.chunk))
+            .map(|label| format!("  {label}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "## {}. {}  [score={:.3}]",
+            "## {}. {}  [score={:.3}]{scope_suffix}",
             i + 1,
             r.chunk.location(),
-            r.score
+            r.score,
         ));
         lines.push("```".to_string());
         lines.push(r.chunk.content.trim().to_string());
@@ -88,12 +102,16 @@ fn render_pretty(header: &str, results: &[SearchResult]) -> String {
     lines.join("\n")
 }
 
-fn render_compact(results: &[SearchResult]) -> String {
+fn render_compact(results: &[SearchResult], symbols: Option<&[Symbol]>) -> String {
     let mut out = String::new();
     for r in results {
         let snippet = first_nonblank_line(&r.chunk.content);
+        let scope_suffix = symbols
+            .and_then(|syms| chunk_scope_label(syms, &r.chunk))
+            .map(|label| format!("  ({label})"))
+            .unwrap_or_default();
         out.push_str(&format!(
-            "{}:{}-{}  [score={:.3}]  {}\n",
+            "{}:{}-{}  [score={:.3}]{scope_suffix}  {}\n",
             r.chunk.file_path, r.chunk.start_line, r.chunk.end_line, r.score, snippet,
         ));
     }
@@ -309,7 +327,7 @@ mod tests {
             r("a.rs", 1, 5, 0.91, "  \nfn foo() {}\nbody\n"),
             r("b.rs", 10, 20, 0.42, "fn bar() {}"),
         ];
-        let out = render(OutputFormat::Compact, "h", &results);
+        let out = render(OutputFormat::Compact, "h", &results, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with("a.rs:1-5"));
@@ -320,7 +338,7 @@ mod tests {
     #[test]
     fn ripgrep_emits_line_per_source_line() {
         let results = vec![r("x.rs", 4, 5, 0.5, "line one\nline two")];
-        let out = render(OutputFormat::Ripgrep, "h", &results);
+        let out = render(OutputFormat::Ripgrep, "h", &results, None);
         assert_eq!(out, "x.rs:4:line one\nx.rs:5:line two\n");
     }
 
@@ -331,14 +349,14 @@ mod tests {
             r("a.rs", 6, 10, 0.8, "y"),
             r("b.rs", 1, 5, 0.7, "z"),
         ];
-        let out = render(OutputFormat::Paths, "h", &results);
+        let out = render(OutputFormat::Paths, "h", &results, None);
         assert_eq!(out, "a.rs\nb.rs\n");
     }
 
     #[test]
     fn json_envelope_parses() {
         let results = vec![r("a.rs", 1, 5, 0.9, "fn x() {}")];
-        let out = render(OutputFormat::Json, "header", &results);
+        let out = render(OutputFormat::Json, "header", &results, None);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["count"], 1);
         assert_eq!(v["results"][0]["file_path"], "a.rs");
@@ -348,7 +366,7 @@ mod tests {
     #[test]
     fn jsonl_one_object_per_line() {
         let results = vec![r("a.rs", 1, 5, 0.9, "x"), r("b.rs", 10, 20, 0.4, "y")];
-        let out = render(OutputFormat::Jsonl, "h", &results);
+        let out = render(OutputFormat::Jsonl, "h", &results, None);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
         for line in lines {

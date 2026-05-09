@@ -95,6 +95,16 @@ pub enum Commands {
         /// Output format: pretty (default), compact, ripgrep, paths, json, jsonl.
         #[arg(short, long, default_value = "pretty")]
         format: String,
+        /// Restrict results to these languages (repeatable, e.g. `-l rust -l python`).
+        /// Overrides the default of "same language as the source chunk".
+        #[arg(short, long, value_name = "LANG", value_delimiter = ',')]
+        lang: Vec<String>,
+        /// Glob pattern of paths to include (repeatable, e.g. `--path 'src/**/*.rs'`).
+        #[arg(short = 'g', long = "path", value_name = "GLOB")]
+        path_glob: Vec<String>,
+        /// Glob pattern of paths to exclude (repeatable, e.g. `--exclude 'tests/**'`).
+        #[arg(short = 'x', long = "exclude", value_name = "GLOB")]
+        exclude_glob: Vec<String>,
         /// Drop results scoring below this threshold.
         #[arg(long)]
         min_score: Option<f64>,
