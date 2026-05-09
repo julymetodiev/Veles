@@ -154,15 +154,18 @@ else is line-oriented and pipe-friendly.
 ### `pretty` (default)
 
 Markdown with fenced code blocks. The original Veles output. Best in a
-terminal, worst for piping.
+terminal, worst for piping. Each result header is suffixed with a
+tree-sitter-derived scope label — ``defines `Foo` `` for chunks that
+contain definitions, or ``in `bar` `` for chunks that live inside a
+larger scope — so the header alone tells you what each chunk is.
 
 ### `compact`
 
-One line per result.
+One line per result, scope label in parentheses.
 
 ```
-crates/veles-core/src/index/sparse.rs:1-50  [score=0.019]  //! BM25 sparse index — inverted-index implementation with token interning.
-crates/veles-core/src/veles_index.rs:496-545  [score=0.017]  let chunks: Vec<Chunk> = files
+crates/veles-core/src/index/sparse.rs:1-50  [score=0.019]  (defines `K1` (+4 more))  //! BM25 sparse index — inverted-index implementation with token interning.
+crates/veles-core/src/veles_index.rs:496-545  [score=0.017]  (defines `stats` (+3 more))  let chunks: Vec<Chunk> = files
 ```
 
 Good for terminal use when you want a list view, or for quick inspection
@@ -259,9 +262,15 @@ Given a file:line, return the most semantically similar chunks elsewhere.
 ```sh
 veles find-related crates/veles-core/src/index/sparse.rs 50
 veles find-related src/auth.rs 120 -t 10 -f compact
+veles find-related src/auth.rs 120 -l rust              # restrict to one language
+veles find-related src/auth.rs 120 -g 'crates/foo/**'   # restrict to a subtree
+veles find-related src/auth.rs 120 -x 'tests/**'        # exclude a subtree
 ```
 
-Works on the same persistent cache, supports `--format` and `--min-score`.
+Works on the same persistent cache. Supports `--format`, `--min-score`,
+and the same `--lang` / `--path` / `--exclude` filters as `search`. By
+default the candidate pool is restricted to the source chunk's
+language; passing any of the filter flags overrides that default.
 
 ## Symbols, defs, refs
 
@@ -406,8 +415,12 @@ veles serve-grpc --addr "[::1]:50051"
 ```
 
 The MCP server exposes `search`, `defs`, `symbols`, `refs`, `stats`,
-`update`, and `find_related` as tools. `search` accepts the same
-`lang` / `path` / `exclude` / `min_score` filters as the CLI. See
+`update`, and `find_related` as tools. `search` and `find_related`
+accept the same `lang` / `path` / `exclude` / `min_score` filters as
+the CLI. `search`, `find_related`, and `refs` also accept a `format`
+argument: `default` (scored code blocks tagged with the enclosing
+scope), `paths` (flat `path:start-end` per line), or `unique_paths`
+(one `path` per file, deduped — for shortlist workflows). See
 `crates/veles-mcp/src/lib.rs` for the JSON-RPC schema and
 [`crates/veles-mcp/README.md`](crates/veles-mcp/README.md) for a
 short description of each tool.
