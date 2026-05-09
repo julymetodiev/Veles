@@ -1,0 +1,23 @@
+[package]
+name = "veles-grpc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "gRPC service for Veles code search"
+
+[dependencies]
+veles-core = { workspace = true }
+model2vec-rs = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
