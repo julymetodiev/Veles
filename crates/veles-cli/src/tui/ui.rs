@@ -274,7 +274,10 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
     }
     let end = (app.list_offset + viewport).min(app.results.len());
 
-    let path_col = (inner.width as usize).saturating_sub(8 + 2 + 1).min(60); // budget for path
+    // Give trailing text (scope label / snippet) more room: cap path
+    // padding at 40 cols rather than 60 so the right-hand label isn't
+    // squeezed to nothing on terminals split 42/58 with a preview pane.
+    let path_col = (inner.width as usize).saturating_sub(8 + 2 + 1).min(40); // budget for path
     let mut lines: Vec<Line> = Vec::with_capacity(end - app.list_offset);
     for idx in app.list_offset..end {
         let r = &app.results[idx];
@@ -331,10 +334,11 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
             ),
         ));
         spans.push(Span::styled("  ".to_string(), row_style(Style::default())));
-        // Scope labels render in italic so users can tell them apart from
-        // raw code snippets at a glance.
+        // Scope labels render in a slightly brighter colour than raw
+        // code snippets so the metadata stands out at a glance. Italic
+        // is intentionally avoided — many terminals don't render it.
         let trailing_style = if trailing_is_scope {
-            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC)
+            Style::default().fg(ACCENT)
         } else {
             Style::default().fg(FAINT)
         };
