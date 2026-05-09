@@ -39,6 +39,7 @@ Originally inspired by [Semble](https://github.com/MinishLab/semble) — Veles s
 - **Definition boosting** — promotes chunks that define the queried symbol
 - **Path penalties** — demotes test files, compat dirs, re-export files
 - **File saturation** — avoids stacking all results from one file
+- **Scope labels on every hit** — search/related/refs results carry a tree-sitter-derived ``defines `Foo` `` or ``in `bar` `` suffix so the result header alone tells you what each chunk is
 - **Multilingual model** option for Cyrillic, CJK, Arabic, etc.
 - **Pipe-friendly output** — `pretty`, `compact`, `ripgrep`, `paths`, `json`, `jsonl`
 - **Filter flags** — `--lang`, `--path` and `--exclude` glob patterns, `--min-score`
@@ -114,6 +115,8 @@ veles refs save_index -t 30                           # defs + BM25 references
 
 ```sh
 veles find-related src/main.rs 42                     # semantically similar chunks
+veles find-related src/main.rs 42  -l rust            # restrict to one language
+veles find-related src/main.rs 42  -g 'crates/foo/**' # restrict to a subtree
 ```
 
 ### Index lifecycle
@@ -192,6 +195,11 @@ Exposed tools:
 | `stats`        | File / chunk counts, model metadata, per-language chunk breakdown.                    |
 | `update`       | Incremental refresh of a local repo's `.veles/` index after edits.                    |
 | `find_related` | Semantically similar chunks for a `(file_path, line)` from an earlier `search`.       |
+
+`search`, `find_related`, and `refs` accept a `format` argument:
+- `default` (default) — scored, fenced code blocks tagged with the enclosing scope.
+- `paths` — flat `path:start-end` per line, no header / score / body.
+- `unique_paths` — collapsed to one `path` line per file. For agent shortlist workflows that just want "which files matter".
 
 ## Build from source
 
