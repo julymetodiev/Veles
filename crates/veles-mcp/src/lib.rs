@@ -150,6 +150,11 @@ fn tools() -> Vec<Tool> {
                     "min_score": {
                         "type": "number",
                         "description": "Drop results whose score is below this threshold."
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["default", "paths"],
+                        "description": "'default' returns scored, fenced code blocks with the enclosing scope. 'paths' returns just `path:start-end` per line — token-cheap shortlist for downstream processing."
                     }
                 },
                 "required": ["query"]
@@ -218,6 +223,11 @@ fn tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Number of BM25 hits to return (definitions are always included).",
                         "default": 10
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["default", "paths"],
+                        "description": "'default' splits into a Definitions section and a BM25 section with code blocks. 'paths' flattens both into a single `path:line` / `path:start-end` list."
                     }
                 },
                 "required": ["name"]
@@ -271,6 +281,11 @@ fn tools() -> Vec<Tool> {
                         "type": "integer",
                         "description": "Number of similar chunks to return.",
                         "default": 5
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["default", "paths"],
+                        "description": "'default' returns scored code blocks with the enclosing scope; 'paths' returns just `path:start-end` per line."
                     }
                 },
                 "required": ["file_path", "line"]
@@ -494,6 +509,7 @@ impl McpServer {
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
         let min_score = args["min_score"].as_f64();
+        let format = args["format"].as_str().unwrap_or("default");
 
         let mut cache = self.cache.lock().await;
         let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
@@ -522,8 +538,12 @@ impl McpServer {
             }));
         }
 
-        let header = format!("Search results for: {query:?} (mode={mode_str})");
-        let text = format_results(&header, &results);
+        let text = if format == "paths" {
+            format_results_paths(&results)
+        } else {
+            let header = format!("Search results for: {query:?} (mode={mode_str})");
+            format_results(&header, &results, Some(index.symbols()))
+        };
 
         Ok(json!({
             "content": [{"type": "text", "text": text}]
@@ -613,6 +633,7 @@ impl McpServer {
         })?;
         let repo = args["repo"].as_str().unwrap_or(".");
         let top_k = args["top_k"].as_u64().unwrap_or(10) as usize;
+        let format = args["format"].as_str().unwrap_or("default");
 
         let mut cache = self.cache.lock().await;
         let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
@@ -635,34 +656,47 @@ impl McpServer {
             }));
         }
 
-        let mut lines: Vec<String> = vec![format!("References to {name:?}"), String::new()];
-        if defs.is_empty() {
-            lines.push("## Definitions".to_string());
-            lines.push("(none)".to_string());
-        } else {
-            lines.push("## Definitions".to_string());
+        let text = if format == "paths" {
+            // Flat list: defs as `path:line`, BM25 hits as `path:start-end`.
+            let mut lines: Vec<String> = Vec::with_capacity(defs.len() + bm25_hits.len());
             for s in &defs {
-                lines.push(format!(
-                    "- {kind} {name} ({lang}) — {file}:{line}",
-                    kind = s.kind.as_str(),
-                    name = s.name,
-                    lang = s.language,
-                    file = s.file_path,
-                    line = s.start_line,
-                ));
+                lines.push(format!("{}:{}", s.file_path, s.start_line));
             }
-        }
-        lines.push(String::new());
-        if bm25_hits.is_empty() {
-            lines.push("## Other matches (BM25)".to_string());
-            lines.push("(none)".to_string());
+            for r in &bm25_hits {
+                lines.push(r.chunk.location());
+            }
+            lines.join("\n")
         } else {
-            let header = format!("## Other matches (BM25) — {} hit(s)", bm25_hits.len());
-            lines.push(format_results(&header, &bm25_hits));
-        }
+            let mut lines: Vec<String> = vec![format!("References to {name:?}"), String::new()];
+            if defs.is_empty() {
+                lines.push("## Definitions".to_string());
+                lines.push("(none)".to_string());
+            } else {
+                lines.push("## Definitions".to_string());
+                for s in &defs {
+                    lines.push(format!(
+                        "- {kind} {name} ({lang}) — {file}:{line}",
+                        kind = s.kind.as_str(),
+                        name = s.name,
+                        lang = s.language,
+                        file = s.file_path,
+                        line = s.start_line,
+                    ));
+                }
+            }
+            lines.push(String::new());
+            if bm25_hits.is_empty() {
+                lines.push("## Other matches (BM25)".to_string());
+                lines.push("(none)".to_string());
+            } else {
+                let header = format!("## Other matches (BM25) — {} hit(s)", bm25_hits.len());
+                lines.push(format_results(&header, &bm25_hits, Some(index.symbols())));
+            }
+            lines.join("\n")
+        };
 
         Ok(json!({
-            "content": [{"type": "text", "text": lines.join("\n")}]
+            "content": [{"type": "text", "text": text}]
         }))
     }
 
@@ -780,6 +814,7 @@ impl McpServer {
 
         let repo = args["repo"].as_str().unwrap_or(".");
         let top_k = args["top_k"].as_u64().unwrap_or(5) as usize;
+        let format = args["format"].as_str().unwrap_or("default");
 
         let mut cache = self.cache.lock().await;
         let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
@@ -803,8 +838,12 @@ impl McpServer {
             }));
         }
 
-        let header = format!("Chunks related to {file_path}:{line}");
-        let text = format_results(&header, &results);
+        let text = if format == "paths" {
+            format_results_paths(&results)
+        } else {
+            let header = format!("Chunks related to {file_path}:{line}");
+            format_results(&header, &results, Some(index.symbols()))
+        };
 
         Ok(json!({
             "content": [{"type": "text", "text": text}]
@@ -842,15 +881,60 @@ fn format_symbols(header: &str, symbols: &[&Symbol]) -> String {
     lines.join("\n")
 }
 
-/// Format search results as numbered, fenced code blocks (same format as Python version).
-fn format_results(header: &str, results: &[veles_core::types::SearchResult]) -> String {
+/// Pick a short scope label for a chunk so an agent can route on the
+/// result header without reading the body.
+///
+/// Two-tier heuristic:
+/// 1. If any symbols *start* inside the chunk, the chunk is showing
+///    those definitions — return ``defines `name` ``.
+/// 2. Else find the most specific symbol whose range strictly contains
+///    `chunk.start_line` (the chunk is mid-body) — return ``in `name` ``.
+///
+/// Returns `None` for chunks that neither define nor live inside any
+/// tree-sitter-recognised symbol (typical for module-level prelude
+/// before the first definition, or files in unsupported languages).
+fn chunk_scope_label(
+    symbols: &[veles_core::symbols::Symbol],
+    chunk: &veles_core::types::Chunk,
+) -> Option<String> {
+    let same_file = || symbols.iter().filter(|s| s.file_path == chunk.file_path);
+
+    let defined: Vec<&veles_core::symbols::Symbol> = same_file()
+        .filter(|s| s.start_line >= chunk.start_line && s.start_line <= chunk.end_line)
+        .collect();
+    if let Some(first) = defined.first() {
+        return Some(if defined.len() == 1 {
+            format!("defines `{}`", first.name)
+        } else {
+            format!("defines `{}` (+{} more)", first.name, defined.len() - 1)
+        });
+    }
+
+    same_file()
+        .filter(|s| s.start_line < chunk.start_line && chunk.start_line <= s.end_line)
+        .min_by_key(|s| s.end_line.saturating_sub(s.start_line))
+        .map(|s| format!("in `{}`", s.name))
+}
+
+/// Format search results as numbered, fenced code blocks. When `symbols`
+/// is `Some`, each header is suffixed with a scope label (e.g.
+/// ``` defines `Manifest` ``` or ``` in `fn search_hybrid` ```).
+fn format_results(
+    header: &str,
+    results: &[veles_core::types::SearchResult],
+    symbols: Option<&[veles_core::symbols::Symbol]>,
+) -> String {
     let mut lines: Vec<String> = vec![header.to_string(), String::new()];
     for (i, r) in results.iter().enumerate() {
+        let scope_suffix = symbols
+            .and_then(|syms| chunk_scope_label(syms, &r.chunk))
+            .map(|label| format!("  {label}"))
+            .unwrap_or_default();
         lines.push(format!(
-            "## {}. {}  [score={:.3}]",
+            "## {}. {}  [score={:.3}]{scope_suffix}",
             i + 1,
             r.chunk.location(),
-            r.score
+            r.score,
         ));
         lines.push("```".to_string());
         lines.push(r.chunk.content.trim().to_string());
@@ -858,4 +942,15 @@ fn format_results(header: &str, results: &[veles_core::types::SearchResult]) -> 
         lines.push(String::new());
     }
     lines.join("\n")
+}
+
+/// Flat `path:start-end` per line — no header, no score, no chunk body.
+/// Optimised for agents that just want a shortlist of files / line ranges
+/// to act on.
+fn format_results_paths(results: &[veles_core::types::SearchResult]) -> String {
+    results
+        .iter()
+        .map(|r| r.chunk.location())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
