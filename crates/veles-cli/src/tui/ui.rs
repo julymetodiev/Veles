@@ -287,10 +287,19 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
         );
         let path_text = pad_or_truncate(&path_text, path_col);
         let score_text = format!("{:>5.3}", r.score);
-        let snippet = first_nonblank_line(&r.chunk.content);
-        let snippet_max = (inner.width as usize)
+
+        // Prefer the tree-sitter scope label (`defines `Foo`` / `in `bar``)
+        // when available — it's a more reliable "what is this" signal than
+        // the chunk's first non-blank line. Fall back to the snippet when
+        // the chunk doesn't sit inside any recognised symbol.
+        let scope_label = veles_core::scope::chunk_scope_label(app.index.symbols(), &r.chunk);
+        let (trailing_text, trailing_is_scope) = match scope_label {
+            Some(label) => (label, true),
+            None => (first_nonblank_line(&r.chunk.content).to_string(), false),
+        };
+        let trailing_max = (inner.width as usize)
             .saturating_sub(arrow.len() + path_text.len() + score_text.len() + 4);
-        let snippet = truncate(snippet, snippet_max);
+        let trailing = truncate(&trailing_text, trailing_max);
 
         let row_style = |s: Style| -> Style {
             match row_bg {
@@ -322,9 +331,16 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
             ),
         ));
         spans.push(Span::styled("  ".to_string(), row_style(Style::default())));
+        // Scope labels render in italic so users can tell them apart from
+        // raw code snippets at a glance.
+        let trailing_style = if trailing_is_scope {
+            Style::default().fg(FAINT).add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(FAINT)
+        };
         spans.push(Span::styled(
-            snippet.to_string(),
-            row_style(Style::default().fg(FAINT)),
+            trailing.to_string(),
+            row_style(trailing_style),
         ));
 
         // Pad rest of the line with spaces so the row-bg fills the row.

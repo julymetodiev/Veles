@@ -79,7 +79,14 @@ pub fn run(
         let _guard = TerminalGuard;
 
         let _ = multilingual; // currently informational only; TUI inherits the loaded model.
-        let mut app = App::new(repo_path, total_files, total_chunks, cmd_tx.clone(), msg_rx);
+        let mut app = App::new(
+            repo_path,
+            total_files,
+            total_chunks,
+            index.clone(),
+            cmd_tx.clone(),
+            msg_rx,
+        );
         app_result = app.run(&mut terminal);
         exit_action = app.exit_action.take();
     }

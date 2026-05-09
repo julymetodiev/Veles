@@ -53,6 +53,10 @@ pub struct App {
     pub repo_path: PathBuf,
     pub total_chunks: usize,
     pub total_files: usize,
+    /// Shared with the search worker. Held here so the renderer can pull
+    /// scope labels (`index.symbols()`) out of the same tree-sitter table
+    /// the worker is searching against.
+    pub index: Arc<veles_core::VelesIndex>,
 
     // Query input.
     pub query: String,
@@ -99,6 +103,7 @@ impl App {
         repo_path: PathBuf,
         total_files: usize,
         total_chunks: usize,
+        index: Arc<veles_core::VelesIndex>,
         cmd_tx: Sender<WorkerCmd>,
         msg_rx: Receiver<WorkerMsg>,
     ) -> Self {
@@ -106,6 +111,7 @@ impl App {
             repo_path,
             total_files,
             total_chunks,
+            index,
             query: String::new(),
             cursor_chars: 0,
             mode: SearchMode::Hybrid,
