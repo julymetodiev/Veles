@@ -1,0 +1,18 @@
+[package]
+name = "veles-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP (Model Context Protocol) server for Veles code search"
+
+[dependencies]
+veles-core = { workspace = true }
+model2vec-rs = { workspace = true }
+tokio = { workspace = true, features = ["io-std", "io-util", "sync", "macros", "rt", "time", "process"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros"] }
