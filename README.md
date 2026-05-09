@@ -122,10 +122,10 @@ Veles/
   crates/
     veles-core/    indexing, chunking, BM25, dense search, ranking, persistence
     veles-grpc/    gRPC service (tonic + prost)
+      proto/
+        veles.proto  gRPC service definition
     veles-mcp/     MCP server over stdio
     veles-cli/     CLI binary
-  proto/
-    veles.proto    gRPC service definition
 ```
 
 The persistent index lives under `<repo>/.veles/`:
