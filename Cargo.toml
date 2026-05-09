@@ -11,9 +11,10 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-authors = ["Julius Methody <julymetodiev@gmail.com>", "Julius Methody <julymetodiev@gmail.com>"]
+authors = ["Julius Methody <julymetodiev@gmail.com>"]
 repository = "https://github.com/julymetodiev/Veles"
-description = "Veles.."
+homepage = "https://github.com/julymetodiev/Veles"
+description = "Fast and accurate local code search for AI agents (Rust reimplementation of Semble)"
 
 [workspace.dependencies]
 # Core dependencies
@@ -44,3 +45,8 @@ bincode = "1.3"
 veles-core = { path = "crates/veles-core" }
 veles-grpc = { path = "crates/veles-grpc" }
 veles-mcp = { path = "crates/veles-mcp" }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

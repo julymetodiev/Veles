@@ -24,12 +24,25 @@ Inspired by [Semble](https://github.com/MinishLab/semble), Veles is a Rust reimp
 - **Filter flags** — `--lang`, `--path` and `--exclude` glob patterns, `--min-score`
 - **Symbol commands** — tree-sitter `symbols` / `defs` / `refs` for Rust, Python, JavaScript, TypeScript, Go
 
+## Install
+
+```sh
+# Linux / macOS
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/julymetodiev/Veles/releases/latest/download/veles-cli-installer.sh | sh
+
+# macOS / Linux Homebrew
+brew install julymetodiev/veles/veles-cli
+
+# From source (any platform)
+cargo install veles-cli
+```
+
+See **[INSTALL.md](INSTALL.md)** for Windows, manual download, and verification.
+
 ## Quickstart
 
 ```sh
-# Build
-cargo build --release
-
 # Index this repo (one-off, ~milliseconds for small repos)
 veles index .
 

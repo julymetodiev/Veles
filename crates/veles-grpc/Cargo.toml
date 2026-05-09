@@ -3,6 +3,8 @@ name = "veles-grpc"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "gRPC service for Veles code search"
 
 [dependencies]

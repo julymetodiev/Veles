@@ -1,0 +1,62 @@
+# Custom cargo-dist publish job: pushes the four library crates to crates.io
+# in dependency order. Triggered by release.yml after the GitHub Release
+# artifacts have been uploaded and the homebrew job has run.
+#
+# Required secrets:
+#   CARGO_REGISTRY_TOKEN  — crates.io API token with publish scope
+#                           (Settings → Secrets and variables → Actions)
+
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+
+      # Cache the registry index so the four sequential publishes don't
+      # each re-fetch metadata.
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+          key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      # Publish in dependency order. cargo publish (1.85+) waits for the
+      # crate to be available on the index before returning, so the next
+      # `cargo publish` can resolve it as a registry dep.
+      - name: Publish veles-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p veles-core
+
+      - name: Publish veles-grpc
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p veles-grpc
+
+      - name: Publish veles-mcp
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p veles-mcp
+
+      - name: Publish veles-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p veles-cli

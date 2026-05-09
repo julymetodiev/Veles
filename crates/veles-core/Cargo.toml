@@ -3,6 +3,8 @@ name = "veles-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
 description = "Core library for Veles code search — indexing, chunking, BM25, dense search, and hybrid ranking"
 
 [dependencies]

@@ -1,0 +1,47 @@
+[workspace]
+members = ["cargo:."]
+
+# cargo-dist configuration. See https://opensource.axo.dev/cargo-dist/.
+[dist]
+# Pin to the cargo-dist version used to generate the release workflow.
+cargo-dist-version = "0.31.0"
+
+# CI backend.
+ci = "github"
+
+# Installers generated alongside the platform tarballs.
+# - shell:      `curl … | sh` for Linux / macOS
+# - powershell: `irm … | iex`  for Windows
+# - homebrew:   formula auto-published to the tap below
+installers = ["shell", "powershell", "homebrew"]
+
+# Target triples to build for. Linux uses musl so the binary is statically
+# linked and runs on any glibc / musl distribution.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+
+# Homebrew tap repo (must already exist as `julymetodiev/homebrew-veles`).
+# cargo-dist opens a PR / pushes a commit there with an updated formula
+# whenever a new release is published.
+tap = "julymetodiev/homebrew-veles"
+
+# Publish jobs run after the release artifacts are uploaded. `homebrew`
+# is built into cargo-dist; `./publish-crates` is a custom job defined
+# in .github/workflows/publish-crates.yml that pushes the four library
+# crates (in dependency order) to crates.io.
+publish-jobs = ["homebrew", "./publish-crates"]
+
+# On pull requests, only run `dist plan` (validates config without
+# building). Full multi-platform builds run only on tag push.
+pr-run-mode = "plan"
+
+# Always include source archives in releases.
+source-tarball = true
+
+# Generate per-platform checksum files alongside the artifacts.
+checksum = "sha256"
