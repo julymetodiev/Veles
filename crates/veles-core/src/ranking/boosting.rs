@@ -16,24 +16,30 @@ use crate::types::Chunk;
 
 // ── Symbol query detection ────────────────────────────────────────────────
 
+// `(?x)` enables verbose mode so unescaped whitespace in the pattern is
+// ignored — without it, the literal newlines and indentation become part
+// of the regex and the symbol-detection branch silently never matches
+// any query.
 static SYMBOL_QUERY_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^(?:\
-        [A-Za-z_][A-Za-z0-9_]*(?:(?:::|\\|->|\.)[A-Za-z_][A-Za-z0-9_]*)+\
-        |_[A-Za-z0-9_]*\
-        |[A-Za-z][A-Za-z0-9]*[A-Z_][A-Za-z0-9_]*\
-        |[A-Z][A-Za-z0-9]*\
+        r"(?x)
+        ^(?:
+            [A-Za-z_][A-Za-z0-9_]* (?: (?:::|\\|->|\.) [A-Za-z_][A-Za-z0-9_]* )+   # qualified: foo::bar, Foo.bar
+          | _[A-Za-z0-9_]*                                                          # leading underscore
+          | [A-Za-z][A-Za-z0-9]* [A-Z_] [A-Za-z0-9_]*                               # camelCase / SCREAMING_SNAKE
+          | [A-Z][A-Za-z0-9]*                                                       # leading uppercase: Foo, Manifest
         )$",
     )
     .unwrap()
 });
 
-/// embedded CamelCase identifiers in NL queries.
+/// Embedded CamelCase identifiers in natural-language queries.
 static EMBEDDED_SYMBOL_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(?:\
-        [A-Z][a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*\
-        |[a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+\
+        r"(?x)
+        \b(?:
+            [A-Z][a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]*    # PascalCase: Foo, FooBar
+          | [a-z][a-zA-Z0-9]*[A-Z][a-zA-Z0-9]+         # camelCase: fooBar
         )\b",
     )
     .unwrap()
@@ -55,6 +61,10 @@ const DEFINITION_KEYWORDS: &[&str] = &[
     "trait", "type", "func", "function", "object", "abstract class",
     "data class", "fn", "fun", "package", "namespace", "protocol",
     "record", "typedef",
+    // Top-level bindings — covers Rust/C/C++/Go/JS/TS constants and globals.
+    // Without these, queries for SCREAMING_SNAKE_CASE constants miss the
+    // definition site entirely.
+    "const", "static",
 ];
 
 /// SQL DDL keywords.
@@ -186,8 +196,12 @@ fn definition_pattern(symbol_name: &str) -> (Regex, Regex) {
         .collect::<Vec<_>>()
         .join("|");
 
-    let general = Regex::new(&format!(r"(?:^|(?<=\s))(?:{kw_body}{suffix}")).unwrap();
-    let sql = Regex::new(&format!(r"(?i)(?:^|(?<=\s))(?:{sql_body}{suffix}")).unwrap();
+    // The Rust `regex` crate does not support lookbehind, so we use `\b`
+    // to require a word boundary before the keyword. All DEFINITION_KEYWORDS
+    // start with a letter, so `\b` correctly distinguishes `class` from
+    // `subclass` (no boundary inside the latter).
+    let general = Regex::new(&format!(r"\b(?:{kw_body}{suffix}")).unwrap();
+    let sql = Regex::new(&format!(r"(?i)\b(?:{sql_body}{suffix}")).unwrap();
     (general, sql)
 }
 
@@ -256,28 +270,26 @@ fn boost_symbol_definitions(
     if symbol_name != trimmed {
         names.push(trimmed);
     }
-    let matchers = DefinitionMatchers::for_names(names);
+    let matchers = DefinitionMatchers::for_names(names.clone());
 
     let boost_unit = max_score * DEFINITION_BOOST_MULTIPLIER;
-    let symbol_lower = symbol_name.to_lowercase();
 
+    // Scan every chunk for a definition match — not just candidates and not
+    // just file-stem-matching chunks. For SCREAMING_SNAKE_CASE constants
+    // (and any short identifier whose name doesn't match its file stem),
+    // BM25 buries the definition site under reference-heavy chunks; the
+    // unconditional scan is what makes the definition boost actually fire.
+    //
+    // The substring pre-filter keeps this O(N) loop cheap on large repos:
+    // most chunks don't mention the symbol at all, and `String::contains`
+    // short-circuits in microseconds.
     for (i, chunk) in chunks.iter().enumerate() {
-        let in_pool = scores[i] > 0.0;
-        if in_pool {
-            let tier = definition_tier(chunk, &matchers, boost_unit);
-            if tier > 0.0 {
-                scores[i] += tier;
-            }
-        } else {
-            // Non-candidate scan: only consider chunks whose file stem matches the symbol.
-            let stem = file_stem_lower(&chunk.file_path);
-            if !stem_matches(&stem, &symbol_lower) {
-                continue;
-            }
-            let tier = definition_tier(chunk, &matchers, boost_unit);
-            if tier > 0.0 {
-                scores[i] += tier;
-            }
+        if !names.iter().any(|n| chunk.content.contains(n)) {
+            continue;
+        }
+        let tier = definition_tier(chunk, &matchers, boost_unit);
+        if tier > 0.0 {
+            scores[i] += tier;
         }
     }
 }
@@ -411,4 +423,112 @@ fn count_keyword_matches(keywords: &AHashSet<String>, parts: &AHashSet<String>) 
         }
     }
     n_matches
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn symbol_queries_recognised() {
+        // Bare identifiers and conventional code-shaped names should all be
+        // detected as "symbol-y" so that hybrid search leans BM25 and the
+        // definition-boost path runs.
+        for q in [
+            "Manifest",
+            "TopK",
+            "CamelCase",
+            "parse_config",
+            "PREVIEW_FILE_CACHE",
+            "_private_thing",
+            "foo::bar",
+            "module::Type",
+            "obj->method",
+            "Foo.bar",
+        ] {
+            assert!(is_symbol_query(q), "expected symbol query: {q:?}");
+        }
+    }
+
+    #[test]
+    fn natural_language_not_a_symbol_query() {
+        for q in [
+            "parse the config file",
+            "how does auth work",
+            "rate limiting middleware",
+            "fn parse_config", // multi-token: not a bare symbol
+        ] {
+            assert!(!is_symbol_query(q), "did not expect symbol query: {q:?}");
+        }
+    }
+
+    #[test]
+    fn embedded_camelcase_is_extracted() {
+        let hits: Vec<&str> = EMBEDDED_SYMBOL_RE
+            .find_iter("how does FooBar interact with bazQux today")
+            .map(|m| m.as_str())
+            .collect();
+        assert!(hits.contains(&"FooBar"), "FooBar not found in {hits:?}");
+        assert!(hits.contains(&"bazQux"), "bazQux not found in {hits:?}");
+    }
+
+    #[test]
+    fn symbol_def_boost_lifts_a_buried_definition() {
+        // Realistic scenario: many chunks contain references to a constant
+        // (e.g. `top_k: TOP_K,` as a function arg), so BM25 ranks them
+        // above the chunk that defines it. The non-candidate scan must
+        // still surface the definition site.
+        use crate::types::Chunk;
+        let chunks = vec![
+            Chunk {
+                content: "const TOP_K: usize = 50;".into(),
+                file_path: "src/app.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                language: Some("rust".into()),
+            },
+            Chunk {
+                content: "fn search(top_k: usize) { call(top_k); }".into(),
+                file_path: "src/search.rs".into(),
+                start_line: 1,
+                end_line: 1,
+                language: Some("rust".into()),
+            },
+        ];
+        // Simulate: only the second chunk made the BM25 candidate pool.
+        let mut scores = vec![0.0, 1.0];
+        apply_query_boost(&mut scores, "TOP_K", &chunks);
+        assert!(
+            scores[0] > scores[1],
+            "expected the const definition to outrank a reference chunk: scores={scores:?}"
+        );
+    }
+
+    #[test]
+    fn definition_pattern_recognises_const_and_static() {
+        // Regression: before adding `const`/`static` to DEFINITION_KEYWORDS,
+        // searching for a top-level constant by name would never trigger
+        // the definition boost, so its definition site got buried under
+        // semantic noise even though BM25 ranked it correctly.
+        let (general, _) = definition_pattern("PREVIEW_FILE_CACHE");
+        assert!(general.is_match("const PREVIEW_FILE_CACHE: usize = 8;"));
+        assert!(general.is_match("static PREVIEW_FILE_CACHE: usize = 8;"));
+    }
+
+    #[test]
+    fn definition_pattern_compiles_and_matches() {
+        // Regression test: the previous regex used `(?<=\s)` lookbehind,
+        // which the `regex` crate doesn't support. Compilation panicked
+        // the moment a symbol query reached this code path.
+        let (general, sql) = definition_pattern("Manifest");
+        assert!(general.is_match("pub struct Manifest {"));
+        assert!(general.is_match("    fn Manifest() {}"));
+        // Word-boundary semantics: should not match "Manifest" inside an
+        // unrelated keyword-like prefix.
+        assert!(!general.is_match("classManifest {"));
+        // SQL pattern is case-insensitive on the keyword.
+        let (_, sql_lower) = definition_pattern("users");
+        assert!(sql_lower.is_match("create table users ("));
+        let _ = sql; // silence dead-code warning if branches drift.
+    }
 }
