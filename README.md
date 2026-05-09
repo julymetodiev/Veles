@@ -2,7 +2,7 @@
 
 Fast local code search for AI agents. Pure Rust — no Python dependencies.
 
-Indexes a repository (local path or git URL), chunks source files, and provides hybrid search combining BM25 and dense vector similarity via [model2vec-rs](https://github.com/MinishLab/model2vec-rs) static embeddings.
+Inspired by [Semble](https://github.com/MinishLab/semble), Veles is a Rust reimplementation of the same hybrid retrieval approach. It uses the same [potion](https://huggingface.co/minishlab) static embedding models via [model2vec-rs](https://github.com/MinishLab/model2vec-rs) — no transformer forward pass at query time, everything runs in milliseconds on CPU.
 
 ## Interfaces
 
@@ -12,7 +12,7 @@ Indexes a repository (local path or git URL), chunks source files, and provides 
 
 ## Features
 
-- Hybrid search with Reciprocal Rank Fusion (RRF) blending BM25 and semantic scores
+- Hybrid search with Reciprocal Rank Fusion (RRF) blending BM25 and semantic scores, using the same potion-code-16M / potion-multilingual-128M models as Semble
 - Identifier-aware tokenizer — splits camelCase, snake_case, and mixed-script names
 - Query-type detection — symbol queries lean BM25, natural language leans semantic
 - Definition boosting — promotes chunks that define the queried symbol
