@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 
 use serde::Serialize;
+use veles_core::symbols::Symbol;
 use veles_core::types::SearchResult;
 
 /// Output format for `search` and `find-related`.
@@ -173,6 +174,105 @@ fn render_json(header: &str, results: &[SearchResult], lines: bool) -> String {
             header,
             count: results.len(),
             results: results.iter().map(to_json_result).collect(),
+        };
+        serde_json::to_string(&env).unwrap_or_default()
+    }
+}
+
+// ── Symbol renderers ─────────────────────────────────────────────────────
+
+/// Render a list of symbols using the same format taxonomy as search results.
+pub fn render_symbols(format: OutputFormat, header: &str, symbols: &[&Symbol]) -> String {
+    match format {
+        OutputFormat::Pretty => render_symbols_pretty(header, symbols),
+        OutputFormat::Compact | OutputFormat::Ripgrep => render_symbols_compact(symbols),
+        OutputFormat::Paths => render_symbols_paths(symbols),
+        OutputFormat::Json => render_symbols_json(header, symbols, false),
+        OutputFormat::Jsonl => render_symbols_json(header, symbols, true),
+    }
+}
+
+fn render_symbols_pretty(header: &str, symbols: &[&Symbol]) -> String {
+    let mut lines: Vec<String> = vec![header.to_string(), String::new()];
+    for s in symbols {
+        lines.push(format!(
+            "  {:9}  {:30}  {}:{}",
+            s.kind.as_str(),
+            s.name,
+            s.file_path,
+            s.start_line
+        ));
+    }
+    lines.join("\n")
+}
+
+fn render_symbols_compact(symbols: &[&Symbol]) -> String {
+    let mut out = String::new();
+    for s in symbols {
+        out.push_str(&format!(
+            "{}:{}\t{}\t{}\n",
+            s.file_path,
+            s.start_line,
+            s.kind.as_str(),
+            s.name,
+        ));
+    }
+    out
+}
+
+fn render_symbols_paths(symbols: &[&Symbol]) -> String {
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    let mut out = String::new();
+    for s in symbols {
+        if seen.insert(s.file_path.as_str()) {
+            out.push_str(&s.file_path);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+#[derive(Serialize)]
+struct JsonSymbol<'a> {
+    name: &'a str,
+    kind: &'a str,
+    file_path: &'a str,
+    start_line: usize,
+    end_line: usize,
+    language: &'a str,
+}
+
+#[derive(Serialize)]
+struct JsonSymbolEnvelope<'a> {
+    header: &'a str,
+    count: usize,
+    symbols: Vec<JsonSymbol<'a>>,
+}
+
+fn to_json_symbol(s: &Symbol) -> JsonSymbol<'_> {
+    JsonSymbol {
+        name: &s.name,
+        kind: s.kind.as_str(),
+        file_path: &s.file_path,
+        start_line: s.start_line,
+        end_line: s.end_line,
+        language: &s.language,
+    }
+}
+
+fn render_symbols_json(header: &str, symbols: &[&Symbol], lines: bool) -> String {
+    if lines {
+        let mut out = String::new();
+        for s in symbols {
+            out.push_str(&serde_json::to_string(&to_json_symbol(s)).unwrap_or_default());
+            out.push('\n');
+        }
+        out
+    } else {
+        let env = JsonSymbolEnvelope {
+            header,
+            count: symbols.len(),
+            symbols: symbols.iter().map(|s| to_json_symbol(s)).collect(),
         };
         serde_json::to_string(&env).unwrap_or_default()
     }

@@ -21,5 +21,13 @@ tempfile = "3"
 ahash = { version = "0.8", features = ["serde"] }
 bincode = { workspace = true }
 
+# Tree-sitter for symbol extraction
+tree-sitter = "0.23"
+tree-sitter-rust = "0.23"
+tree-sitter-python = "0.23"
+tree-sitter-javascript = "0.23"
+tree-sitter-typescript = "0.23"
+tree-sitter-go = "0.23"
+
 [dev-dependencies]
 tempfile = "3"

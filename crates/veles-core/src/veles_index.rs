@@ -13,6 +13,7 @@ use crate::index::search::{search_bm25, search_hybrid, search_semantic};
 use crate::index::sparse::Bm25Index;
 use crate::model;
 use crate::persist::{self, FileFingerprint, Manifest, UpdateReport};
+use crate::symbols::{self, Symbol};
 use crate::tokenizer::tokenize_into;
 use crate::types::{Chunk, IndexStats, SearchMode, SearchResult};
 use crate::walker;
@@ -25,6 +26,9 @@ pub struct VelesIndex {
     dense_index: DenseIndex,
     file_mapping: HashMap<String, Vec<usize>>,
     language_mapping: HashMap<String, Vec<usize>>,
+    /// Tree-sitter-extracted definitions, one per (file, name).
+    /// Empty for files in unsupported languages.
+    symbols: Vec<Symbol>,
     /// Per-file fingerprints + model metadata. Populated on `from_path`,
     /// `from_git`, `load`, and `update_from_path`. Used by `save` and
     /// `update_from_path` for incremental rebuilds.
@@ -49,7 +53,7 @@ impl VelesIndex {
 
         let model = model.unwrap_or(model::load_model(None)?);
         let exts = walker::filter_extensions(extensions.as_ref(), include_text_files);
-        let chunks = collect_chunks(&path, &path, &exts)?;
+        let (chunks, symbols) = collect_chunks_and_symbols(&path, &path, &exts)?;
 
         if chunks.is_empty() {
             bail!("No supported files found under {}", path.display());
@@ -72,6 +76,7 @@ impl VelesIndex {
             dense_index,
             file_mapping,
             language_mapping,
+            symbols,
             manifest,
         })
     }
@@ -106,7 +111,7 @@ impl VelesIndex {
         let model = model.unwrap_or(model::load_model(None)?);
         let resolved = tmp_path.canonicalize()?;
         let exts = walker::filter_extensions(None, include_text_files);
-        let chunks = collect_chunks(&resolved, &resolved, &exts)?;
+        let (chunks, symbols) = collect_chunks_and_symbols(&resolved, &resolved, &exts)?;
 
         if chunks.is_empty() {
             bail!("No supported files found in cloned repository");
@@ -125,6 +130,7 @@ impl VelesIndex {
             dense_index,
             file_mapping,
             language_mapping,
+            symbols,
             manifest: None,
         })
     }
@@ -141,6 +147,7 @@ impl VelesIndex {
             &self.chunks,
             &self.bm25_index,
             &self.dense_index,
+            &self.symbols,
         )
     }
 
@@ -159,6 +166,7 @@ impl VelesIndex {
             dense_index: persisted.dense,
             file_mapping,
             language_mapping,
+            symbols: persisted.symbols,
             manifest: Some(persisted.manifest),
         })
     }
@@ -166,6 +174,25 @@ impl VelesIndex {
     /// Borrow the manifest, if available.
     pub fn manifest(&self) -> Option<&Manifest> {
         self.manifest.as_ref()
+    }
+
+    /// All extracted symbols across the index.
+    pub fn symbols(&self) -> &[Symbol] {
+        &self.symbols
+    }
+
+    /// Symbols belonging to a specific file path (matches the path stored in
+    /// chunks, i.e. relative to the index root).
+    pub fn symbols_for_file(&self, file_path: &str) -> Vec<&Symbol> {
+        self.symbols
+            .iter()
+            .filter(|s| s.file_path == file_path)
+            .collect()
+    }
+
+    /// Find every symbol with the given exact name (across all files).
+    pub fn find_definitions(&self, name: &str) -> Vec<&Symbol> {
+        self.symbols.iter().filter(|s| s.name == name).collect()
     }
 
     /// Incrementally update the index against the current state of `repo_root`.
@@ -259,26 +286,50 @@ impl VelesIndex {
         let kept_chunks: Vec<Chunk> =
             keep_indices.iter().map(|&i| self.chunks[i].clone()).collect();
 
-        // Chunk modified + added files.
+        // Keep the symbols belonging to unchanged files; the rest get
+        // re-extracted in lock-step with re-chunking.
+        let kept_symbols: Vec<Symbol> = self
+            .symbols
+            .iter()
+            .filter(|s| unchanged_set.contains(s.file_path.as_str()))
+            .cloned()
+            .collect();
+
+        // Chunk + extract symbols for modified + added files. We pair both
+        // in one pass to amortise the file read.
         let mut to_chunk: Vec<String> = Vec::with_capacity(modified.len() + added.len());
         to_chunk.extend(modified.iter().cloned());
         to_chunk.extend(added.iter().cloned());
 
-        let new_chunks: Vec<Chunk> = to_chunk
+        let new_pairs: Vec<(Vec<Chunk>, Vec<Symbol>)> = to_chunk
             .par_iter()
-            .flat_map_iter(|rel| {
+            .map(|rel| {
                 let abs = match on_disk.get(rel) {
                     Some((abs, _, _)) => abs.clone(),
-                    None => return Vec::new().into_iter(),
+                    None => return (Vec::new(), Vec::new()),
                 };
                 let language = walker::language_for_path(&abs).map(|s| s.to_string());
                 let content = match std::fs::read_to_string(&abs) {
                     Ok(c) => c,
-                    Err(_) => return Vec::new().into_iter(),
+                    Err(_) => return (Vec::new(), Vec::new()),
                 };
-                chunker::chunk_source(&content, rel, language.as_deref()).into_iter()
+                let chunks = chunker::chunk_source(&content, rel, language.as_deref());
+                let syms = match language.as_deref() {
+                    Some(lang) if symbols::supports(lang) => {
+                        symbols::extract_symbols(&content, rel, lang)
+                    }
+                    _ => Vec::new(),
+                };
+                (chunks, syms)
             })
             .collect();
+
+        let mut new_chunks: Vec<Chunk> = Vec::new();
+        let mut new_symbols: Vec<Symbol> = Vec::new();
+        for (cs, ss) in new_pairs {
+            new_chunks.extend(cs);
+            new_symbols.extend(ss);
+        }
 
         // Embed only the new chunks (the expensive step we save).
         let new_texts: Vec<String> = new_chunks.iter().map(|c| c.content.clone()).collect();
@@ -293,6 +344,8 @@ impl VelesIndex {
         all_chunks.extend(new_chunks.iter().cloned());
         let mut all_embeddings = kept_embeddings;
         all_embeddings.extend(new_embeddings);
+        let mut all_symbols = kept_symbols;
+        all_symbols.extend(new_symbols);
 
         // Rebuild BM25 from full token set, dense from combined embeddings.
         let bm25_index = build_bm25(&all_chunks);
@@ -338,6 +391,7 @@ impl VelesIndex {
         self.dense_index = dense_index;
         self.file_mapping = file_mapping;
         self.language_mapping = language_mapping;
+        self.symbols = all_symbols;
         self.manifest = Some(new_manifest);
 
         Ok(report)
@@ -482,32 +536,48 @@ impl VelesIndex {
     }
 }
 
-/// Collect chunks from all files under `root`, storing paths relative to `display_root`.
+/// Collect chunks **and tree-sitter symbols** for every file under `root`,
+/// storing paths relative to `display_root`.
 ///
-/// File reading, language inference, and chunking run in parallel across files.
-fn collect_chunks(
+/// File reading, language inference, chunking, and symbol extraction run in
+/// parallel across files. Each file is read exactly once.
+fn collect_chunks_and_symbols(
     root: &Path,
     display_root: &Path,
     extensions: &HashSet<String>,
-) -> Result<Vec<Chunk>> {
-    // Walk first (sequential, cheap), then chunk in parallel.
+) -> Result<(Vec<Chunk>, Vec<Symbol>)> {
     let files: Vec<PathBuf> = walker::walk_files(root, extensions).collect();
 
-    let chunks: Vec<Chunk> = files
+    let per_file: Vec<(Vec<Chunk>, Vec<Symbol>)> = files
         .par_iter()
-        .flat_map_iter(|file_path| {
+        .map(|file_path| {
             let language = walker::language_for_path(file_path).map(|s| s.to_string());
             let content = match std::fs::read_to_string(file_path) {
                 Ok(c) => c,
-                Err(_) => return Vec::new().into_iter(),
+                Err(_) => return (Vec::new(), Vec::new()),
             };
             let chunk_path = file_path.strip_prefix(display_root).unwrap_or(file_path);
             let chunk_path_str = chunk_path.to_string_lossy().into_owned();
-            chunker::chunk_source(&content, &chunk_path_str, language.as_deref()).into_iter()
+
+            let chunks =
+                chunker::chunk_source(&content, &chunk_path_str, language.as_deref());
+            let syms = match language.as_deref() {
+                Some(lang) if symbols::supports(lang) => {
+                    symbols::extract_symbols(&content, &chunk_path_str, lang)
+                }
+                _ => Vec::new(),
+            };
+            (chunks, syms)
         })
         .collect();
 
-    Ok(chunks)
+    let mut chunks = Vec::new();
+    let mut symbols = Vec::new();
+    for (cs, ss) in per_file {
+        chunks.extend(cs);
+        symbols.extend(ss);
+    }
+    Ok((chunks, symbols))
 }
 
 /// Build BM25 and dense indexes from chunks.

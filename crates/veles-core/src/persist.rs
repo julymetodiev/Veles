@@ -24,18 +24,21 @@ use serde::{Deserialize, Serialize};
 
 use crate::index::dense::DenseIndex;
 use crate::index::sparse::Bm25Index;
+use crate::symbols::Symbol;
 use crate::types::Chunk;
 
 /// Directory name used under the indexed repo to store the on-disk index.
 pub const INDEX_DIR_NAME: &str = ".veles";
 
-/// Bumped whenever the on-disk format changes incompatibly.
-pub const FORMAT_VERSION: u32 = 1;
+/// Bumped whenever the on-disk format changes incompatibly. Bumped to 2
+/// when symbols.bin was added — older indexes lack tree-sitter symbols.
+pub const FORMAT_VERSION: u32 = 2;
 
 const MANIFEST_FILE: &str = "manifest.json";
 const CHUNKS_FILE: &str = "chunks.bin";
 const BM25_FILE: &str = "bm25.bin";
 const DENSE_FILE: &str = "dense.bin";
+const SYMBOLS_FILE: &str = "symbols.bin";
 
 /// Cheap fingerprint for change detection — size + mtime is fast and covers
 /// almost all real edits. Content hashing can be added later if needed.
@@ -134,6 +137,7 @@ pub struct PersistedIndex {
     pub chunks: Vec<Chunk>,
     pub bm25: Bm25Index,
     pub dense: DenseIndex,
+    pub symbols: Vec<Symbol>,
 }
 
 /// Write all index artefacts to `<repo_root>/.veles/`.
@@ -143,6 +147,7 @@ pub fn save(
     chunks: &[Chunk],
     bm25: &Bm25Index,
     dense: &DenseIndex,
+    symbols: &[Symbol],
 ) -> Result<()> {
     let dir = index_dir_for(repo_root);
     fs::create_dir_all(&dir)
@@ -152,6 +157,7 @@ pub fn save(
     write_bincode(&dir.join(CHUNKS_FILE), &chunks.to_vec())?;
     write_bincode(&dir.join(BM25_FILE), bm25)?;
     write_bincode(&dir.join(DENSE_FILE), dense)?;
+    write_bincode(&dir.join(SYMBOLS_FILE), &symbols.to_vec())?;
     Ok(())
 }
 
@@ -165,7 +171,7 @@ pub fn load(repo_root: &Path) -> Result<PersistedIndex> {
     let manifest: Manifest = read_json(&dir.join(MANIFEST_FILE))?;
     if manifest.format_version != FORMAT_VERSION {
         bail!(
-            "Index format version {} is incompatible (expected {}). Run `veles index` to rebuild.",
+            "Index format version {} is incompatible (expected {}). Run `veles index --force` to rebuild.",
             manifest.format_version,
             FORMAT_VERSION
         );
@@ -173,12 +179,19 @@ pub fn load(repo_root: &Path) -> Result<PersistedIndex> {
     let chunks: Vec<Chunk> = read_bincode(&dir.join(CHUNKS_FILE))?;
     let bm25: Bm25Index = read_bincode(&dir.join(BM25_FILE))?;
     let dense: DenseIndex = read_bincode(&dir.join(DENSE_FILE))?;
+    // Symbols file may be missing on a partially-written index; treat as empty.
+    let symbols: Vec<Symbol> = if dir.join(SYMBOLS_FILE).is_file() {
+        read_bincode(&dir.join(SYMBOLS_FILE))?
+    } else {
+        Vec::new()
+    };
 
     Ok(PersistedIndex {
         manifest,
         chunks,
         bm25,
         dense,
+        symbols,
     })
 }
 

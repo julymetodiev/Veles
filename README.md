@@ -22,6 +22,7 @@ Inspired by [Semble](https://github.com/MinishLab/semble), Veles is a Rust reimp
 - **Multilingual model** option for Cyrillic, CJK, Arabic, etc.
 - **Pipe-friendly output** — `pretty`, `compact`, `ripgrep`, `paths`, `json`, `jsonl`
 - **Filter flags** — `--lang`, `--path` and `--exclude` glob patterns, `--min-score`
+- **Symbol commands** — tree-sitter `symbols` / `defs` / `refs` for Rust, Python, JavaScript, TypeScript, Go
 
 ## Quickstart
 
@@ -66,6 +67,11 @@ veles search "BM25" --min-score 0.4
 
 # Find code related to a specific location
 veles find-related src/main.rs 42
+
+# Symbol-aware (tree-sitter)
+veles symbols crates/veles-core/src/persist.rs
+veles defs Manifest -k struct
+veles refs save_index -t 30 -f compact
 
 # Remote repo (cloned to temp, no persistent cache)
 veles search "BM25 inverted index" https://github.com/julymetodiev/Veles

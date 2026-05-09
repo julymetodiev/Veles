@@ -163,6 +163,56 @@ enum Commands {
         include_text_files: bool,
     },
 
+    /// List definitions in a single file (functions, structs, classes, ...).
+    ///
+    /// Tree-sitter parses the file directly — no index required.
+    Symbols {
+        /// File to outline.
+        file: String,
+        /// Output format: pretty (default), compact, paths, json, jsonl.
+        #[arg(short, long, default_value = "pretty")]
+        format: String,
+    },
+
+    /// Find every definition with the given name across the indexed repo.
+    Defs {
+        /// Symbol name to look up (exact match).
+        name: String,
+        /// Local path of the indexed repo (default: current directory).
+        #[arg(default_value = ".")]
+        path: String,
+        /// Restrict to specific languages (comma-separated).
+        #[arg(short = 'l', long, value_delimiter = ',')]
+        lang: Vec<String>,
+        /// Restrict to a kind (function, struct, class, enum, trait, interface, type, const, static, var, module, method, macro).
+        #[arg(short = 'k', long)]
+        kind: Option<String>,
+        /// Output format: pretty (default), compact, paths, json, jsonl.
+        #[arg(short, long, default_value = "pretty")]
+        format: String,
+        /// Use the multilingual embedding model (must match how the index was built).
+        #[arg(long)]
+        multilingual: bool,
+    },
+
+    /// Find references to a symbol — its definitions plus BM25 hits in chunks.
+    Refs {
+        /// Symbol name to search for.
+        name: String,
+        /// Local path of the indexed repo (default: current directory).
+        #[arg(default_value = ".")]
+        path: String,
+        /// Number of BM25 hits to include alongside definitions.
+        #[arg(short, long, default_value = "20")]
+        top_k: usize,
+        /// Output format: pretty (default), compact, ripgrep, paths, json, jsonl.
+        #[arg(short, long, default_value = "pretty")]
+        format: String,
+        /// Use the multilingual embedding model.
+        #[arg(long)]
+        multilingual: bool,
+    },
+
     /// Print a shell completion script to stdout.
     ///
     /// Examples:
@@ -418,6 +468,162 @@ async fn main() -> Result<()> {
             }
         }
 
+        Some(Commands::Symbols { file, format: format_str }) => {
+            let format: OutputFormat = format_str
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let path = PathBuf::from(&file);
+            if !path.is_file() {
+                bail!("File not found: {file}");
+            }
+            let language = veles_core::walker::language_for_path(&path)
+                .ok_or_else(|| anyhow::anyhow!("Unsupported file type: {file}"))?;
+            if !veles_core::symbols::supports(language) {
+                eprintln!(
+                    "No tree-sitter parser for {language} files yet. Supported: rust, python, javascript, typescript, go."
+                );
+                std::process::exit(1);
+            }
+            let content = std::fs::read_to_string(&path)
+                .with_context(|| format!("read {file}"))?;
+            let syms = veles_core::symbols::extract_symbols(&content, &file, language);
+            let refs: Vec<&_> = syms.iter().collect();
+            emit_symbols(format, &format!("Symbols in {file}"), "symbols", &refs);
+        }
+
+        Some(Commands::Defs {
+            name,
+            path,
+            lang,
+            kind,
+            format: format_str,
+            multilingual,
+        }) => {
+            let format: OutputFormat = format_str
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let index = open_index(&path, multilingual, false, true)?;
+
+            let kind_filter = kind
+                .as_ref()
+                .map(|k| k.to_ascii_lowercase());
+
+            let mut hits: Vec<&veles_core::symbols::Symbol> = index
+                .symbols()
+                .iter()
+                .filter(|s| s.name == name)
+                .filter(|s| {
+                    lang.is_empty() || lang.iter().any(|l| l == &s.language)
+                })
+                .filter(|s| match &kind_filter {
+                    Some(k) => s.kind.as_str() == k,
+                    None => true,
+                })
+                .collect();
+            hits.sort_by(|a, b| {
+                a.file_path
+                    .cmp(&b.file_path)
+                    .then(a.start_line.cmp(&b.start_line))
+            });
+
+            emit_symbols(
+                format,
+                &format!("Definitions of {name:?}"),
+                "definitions",
+                &hits,
+            );
+        }
+
+        Some(Commands::Refs {
+            name,
+            path,
+            top_k,
+            format: format_str,
+            multilingual,
+        }) => {
+            let format: OutputFormat = format_str
+                .parse()
+                .map_err(|e: String| anyhow::anyhow!(e))?;
+            let index = open_index(&path, multilingual, false, true)?;
+
+            // Defs first (high-confidence). Always shown in pretty;
+            // for line-oriented formats they're the head of the output.
+            let defs: Vec<&veles_core::symbols::Symbol> = index
+                .symbols()
+                .iter()
+                .filter(|s| s.name == name)
+                .collect();
+
+            let bm25_hits = index.search(&name, top_k, SearchMode::Bm25, None, None, None);
+
+            // Pretty: print as two sections. Other formats: emit defs as
+            // symbol records, then BM25 hits as result records, both
+            // line-oriented.
+            match format {
+                OutputFormat::Pretty => {
+                    let header = format!("References to {name:?}");
+                    println!("{header}\n");
+                    if defs.is_empty() {
+                        println!("(no definitions found)");
+                    } else {
+                        println!("## Definitions");
+                        for s in &defs {
+                            println!(
+                                "  {:9}  {:30}  {}:{}",
+                                s.kind.as_str(),
+                                s.name,
+                                s.file_path,
+                                s.start_line
+                            );
+                        }
+                    }
+                    println!();
+                    if bm25_hits.is_empty() {
+                        println!("(no BM25 hits)");
+                    } else {
+                        println!("## Other matches (BM25)");
+                        let rendered = format::render(
+                            OutputFormat::Pretty,
+                            &format!("{} BM25 result(s)", bm25_hits.len()),
+                            &bm25_hits,
+                        );
+                        println!("{rendered}");
+                    }
+                }
+                _ => {
+                    // Line-oriented: defs first, then hits.
+                    if !defs.is_empty() {
+                        let rendered = format::render_symbols(
+                            format,
+                            &format!("Definitions of {name:?}"),
+                            &defs,
+                        );
+                        if rendered.ends_with('\n') {
+                            print!("{rendered}");
+                        } else if !rendered.is_empty() {
+                            println!("{rendered}");
+                        }
+                    }
+                    if !bm25_hits.is_empty() {
+                        let rendered = format::render(
+                            format,
+                            &format!("BM25 hits for {name:?}"),
+                            &bm25_hits,
+                        );
+                        if rendered.ends_with('\n') {
+                            print!("{rendered}");
+                        } else if !rendered.is_empty() {
+                            println!("{rendered}");
+                        }
+                    }
+                    if defs.is_empty() && bm25_hits.is_empty() {
+                        eprintln!("No matches for {name:?}.");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        }
+
         Some(Commands::Completions { shell }) => {
             let mut cmd = Cli::command();
             let bin_name = cmd.get_name().to_string();
@@ -493,6 +699,28 @@ fn load_model(multilingual: bool) -> Result<model::StaticModel> {
         model::load_multilingual_model()
     } else {
         model::load_model(None)
+    }
+}
+
+/// Render symbols in the chosen format and write to stdout.
+fn emit_symbols(
+    format: OutputFormat,
+    header: &str,
+    what: &str,
+    symbols: &[&veles_core::symbols::Symbol],
+) {
+    if symbols.is_empty() {
+        let msg = format::empty_message(format, what);
+        if !msg.is_empty() {
+            println!("{msg}");
+        }
+        return;
+    }
+    let rendered = format::render_symbols(format, header, symbols);
+    if rendered.ends_with('\n') {
+        print!("{rendered}");
+    } else {
+        println!("{rendered}");
     }
 }
 

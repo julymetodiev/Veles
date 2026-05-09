@@ -9,6 +9,7 @@ pub mod index;
 pub mod model;
 pub mod persist;
 pub mod ranking;
+pub mod symbols;
 pub mod veles_index;
 pub mod tokenizer;
 pub mod types;

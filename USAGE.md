@@ -12,6 +12,7 @@ see the [README](README.md).
 - [Output formats](#output-formats)
 - [Filters](#filters)
 - [Finding related code](#finding-related-code)
+- [Symbols, defs, refs](#symbols-defs-refs)
 - [Working with remote repos](#working-with-remote-repos)
 - [Multilingual content](#multilingual-content)
 - [Recipes](#recipes)
@@ -261,6 +262,70 @@ veles find-related src/auth.rs 120 -t 10 -f compact
 ```
 
 Works on the same persistent cache, supports `--format` and `--min-score`.
+
+## Symbols, defs, refs
+
+Veles parses each indexed file with tree-sitter and stores the
+definitions in `.veles/symbols.bin`. This unlocks three commands
+that ripgrep can't easily replicate.
+
+Supported languages: **Rust, Python, JavaScript, TypeScript, Go**.
+Other languages are still indexed for search; they just don't
+contribute symbols.
+
+### `veles symbols <file>`
+
+List every definition in a single file. No index required —
+parses the file directly.
+
+```sh
+veles symbols src/main.rs
+veles symbols crates/veles-core/src/persist.rs -f compact
+```
+
+Output kinds: `function`, `method`, `struct`, `class`, `enum`,
+`trait`, `interface`, `type`, `const`, `static`, `var`,
+`module`, `macro`.
+
+### `veles defs <name>`
+
+Find every definition with the given exact name across the
+indexed repo. Reads from the symbol cache, so it's near-instant.
+
+```sh
+veles defs Manifest
+veles defs save -k function           # only functions named "save"
+veles defs parse -l rust,python       # restrict by language
+veles defs MyType -f json | jq '.symbols[].file_path'
+```
+
+Flags:
+
+| Flag             | Description                                                  |
+|------------------|--------------------------------------------------------------|
+| `-l, --lang`     | Comma-separated language filter                              |
+| `-k, --kind`     | Filter by kind (function, struct, class, enum, trait, type, …) |
+| `-f, --format`   | `pretty` / `compact` / `paths` / `json` / `jsonl`            |
+
+### `veles refs <name>`
+
+References to a symbol — combines definitions (high confidence)
+with BM25 hits in the rest of the corpus (best-effort identifier
+matches).
+
+```sh
+veles refs Manifest
+veles refs parse_config -t 30 -f compact
+```
+
+In `pretty`, the output has two clear sections (`Definitions` and
+`Other matches (BM25)`). In line-oriented formats both streams
+are concatenated, defs first.
+
+> Note: tree-sitter symbol caching bumps the on-disk format
+> version. Existing indexes will be rejected with
+> "format version 1 is incompatible (expected 2)". Run
+> `veles index . --force` to rebuild.
 
 ## Working with remote repos
 
