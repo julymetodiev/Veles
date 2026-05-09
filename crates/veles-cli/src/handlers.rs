@@ -188,7 +188,11 @@ pub fn handle_status(path: String) -> Result<()> {
     let on_disk: std::collections::HashMap<String, (u64, i64)> =
         veles_core::walker::walk_files(&path_buf, &exts)
             .filter_map(|abs| {
-                let rel = abs.strip_prefix(&path_buf).ok()?.to_string_lossy().into_owned();
+                let rel = abs
+                    .strip_prefix(&path_buf)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
                 let meta = std::fs::metadata(&abs).ok()?;
                 let mtime = meta
                     .modified()
@@ -352,11 +356,8 @@ pub fn handle_refs(
         _ => {
             // Line-oriented: defs first, then hits.
             if !defs.is_empty() {
-                let rendered = format::render_symbols(
-                    format,
-                    &format!("Definitions of {name:?}"),
-                    &defs,
-                );
+                let rendered =
+                    format::render_symbols(format, &format!("Definitions of {name:?}"), &defs);
                 write_or_fall_through(&rendered);
             }
             if !bm25_hits.is_empty() {
@@ -434,8 +435,7 @@ pub fn handle_man(out_dir: Option<PathBuf>) -> Result<()> {
     let cmd = Cli::command();
     match out_dir {
         Some(dir) => {
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create {}", dir.display()))?;
+            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
             let written = write_man_pages(cmd, &dir, None)?;
             eprintln!("Wrote {written} man page(s) to {}", dir.display());
         }
@@ -465,8 +465,7 @@ fn write_man_pages(
 
     let mut written = 1;
     let path = dir.join(format!("{full_name}.1"));
-    let mut file = File::create(&path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let mut file = File::create(&path).with_context(|| format!("create {}", path.display()))?;
 
     // Render with the full name in `.TH` so the page header reads
     // `veles-search(1)` instead of just `search(1)`.
@@ -493,4 +492,3 @@ fn write_man_pages(
     }
     Ok(written)
 }
-

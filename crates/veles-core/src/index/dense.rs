@@ -146,7 +146,9 @@ impl DenseIndex {
                 })
                 .collect()
         } else {
-            (0..self.n).map(|idx| (idx, dot(self.row(idx), &q))).collect()
+            (0..self.n)
+                .map(|idx| (idx, dot(self.row(idx), &q)))
+                .collect()
         };
 
         let topk = top_k_from_iter_f32(scored, k);

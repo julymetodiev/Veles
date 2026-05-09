@@ -58,8 +58,7 @@ impl FileFingerprint {
     /// Compute the fingerprint for a path on disk. `chunk_count` is provided
     /// by the caller after chunking.
     pub fn from_path(path: &Path, chunk_count: usize) -> Result<Self> {
-        let meta = fs::metadata(path)
-            .with_context(|| format!("stat {}", path.display()))?;
+        let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
         let mtime = meta.modified().unwrap_or(UNIX_EPOCH);
         let mtime_secs = mtime
             .duration_since(UNIX_EPOCH)
@@ -101,11 +100,7 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn new(
-        model_name: &str,
-        embedding_dim: usize,
-        include_text_files: bool,
-    ) -> Self {
+    pub fn new(model_name: &str, embedding_dim: usize, include_text_files: bool) -> Self {
         Self {
             veles_version: env!("CARGO_PKG_VERSION").to_string(),
             format_version: FORMAT_VERSION,
@@ -164,8 +159,7 @@ pub fn save(
     symbols: &[Symbol],
 ) -> Result<()> {
     let dir = index_dir_for(repo_root);
-    fs::create_dir_all(&dir)
-        .with_context(|| format!("create index dir {}", dir.display()))?;
+    fs::create_dir_all(&dir).with_context(|| format!("create index dir {}", dir.display()))?;
 
     write_json(&dir.join(MANIFEST_FILE), manifest)?;
     write_bincode(&dir.join(CHUNKS_FILE), &chunks.to_vec())?;
@@ -219,44 +213,37 @@ pub fn load_manifest(repo_root: &Path) -> Result<Manifest> {
 pub fn clean(repo_root: &Path) -> Result<bool> {
     let dir = index_dir_for(repo_root);
     if dir.is_dir() {
-        fs::remove_dir_all(&dir)
-            .with_context(|| format!("remove {}", dir.display()))?;
+        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
         return Ok(true);
     }
     Ok(false)
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let f = fs::File::create(path)
-        .with_context(|| format!("create {}", path.display()))?;
-    serde_json::to_writer_pretty(f, value)
-        .with_context(|| format!("write {}", path.display()))?;
+    let f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    serde_json::to_writer_pretty(f, value).with_context(|| format!("write {}", path.display()))?;
     Ok(())
 }
 
 fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let f = fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let value = serde_json::from_reader(std::io::BufReader::new(f))
         .with_context(|| format!("parse {}", path.display()))?;
     Ok(value)
 }
 
 fn write_bincode<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let f = fs::File::create(path)
-        .with_context(|| format!("create {}", path.display()))?;
+    let f = fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
     let mut w = std::io::BufWriter::new(f);
-    bincode::serialize_into(&mut w, value)
-        .with_context(|| format!("encode {}", path.display()))?;
+    bincode::serialize_into(&mut w, value).with_context(|| format!("encode {}", path.display()))?;
     Ok(())
 }
 
 fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
-    let f = fs::File::open(path)
-        .with_context(|| format!("open {}", path.display()))?;
+    let f = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
     let r = std::io::BufReader::new(f);
-    let value = bincode::deserialize_from(r)
-        .with_context(|| format!("decode {}", path.display()))?;
+    let value =
+        bincode::deserialize_from(r).with_context(|| format!("decode {}", path.display()))?;
     Ok(value)
 }
 

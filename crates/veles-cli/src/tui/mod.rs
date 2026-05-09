@@ -46,9 +46,7 @@ pub fn run(
     let stats = index.stats();
     let total_files = stats.indexed_files;
     let total_chunks = stats.total_chunks;
-    eprintln!(
-        "Loaded {total_files} files / {total_chunks} chunks. Starting TUI ..."
-    );
+    eprintln!("Loaded {total_files} files / {total_chunks} chunks. Starting TUI ...");
     let index = Arc::new(index);
 
     // Background search worker.
@@ -81,13 +79,7 @@ pub fn run(
         let _guard = TerminalGuard;
 
         let _ = multilingual; // currently informational only; TUI inherits the loaded model.
-        let mut app = App::new(
-            repo_path,
-            total_files,
-            total_chunks,
-            cmd_tx.clone(),
-            msg_rx,
-        );
+        let mut app = App::new(repo_path, total_files, total_chunks, cmd_tx.clone(), msg_rx);
         app_result = app.run(&mut terminal);
         exit_action = app.exit_action.take();
     }
@@ -138,7 +130,6 @@ fn run_editor(file: &Path, line: usize) -> Result<()> {
     } else {
         cmd.arg(format!("+{line}")).arg(file);
     }
-    cmd.status()
-        .with_context(|| format!("running {editor}"))?;
+    cmd.status().with_context(|| format!("running {editor}"))?;
     Ok(())
 }

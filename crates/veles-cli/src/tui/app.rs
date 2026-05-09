@@ -349,11 +349,7 @@ impl App {
             KeyCode::Char('w') if ctrl => self.delete_word_back(),
             KeyCode::Char('k') if ctrl => self.kill_to_end(),
 
-            KeyCode::Char(c) => {
-                if !ctrl {
-                    self.insert_char(c);
-                }
-            }
+            KeyCode::Char(c) if !ctrl => self.insert_char(c),
             _ => {}
         }
     }

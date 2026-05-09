@@ -94,11 +94,7 @@ fn render_compact(results: &[SearchResult]) -> String {
         let snippet = first_nonblank_line(&r.chunk.content);
         out.push_str(&format!(
             "{}:{}-{}  [score={:.3}]  {}\n",
-            r.chunk.file_path,
-            r.chunk.start_line,
-            r.chunk.end_line,
-            r.score,
-            snippet,
+            r.chunk.file_path, r.chunk.start_line, r.chunk.end_line, r.score, snippet,
         ));
     }
     out
@@ -107,10 +103,8 @@ fn render_compact(results: &[SearchResult]) -> String {
 fn render_ripgrep(results: &[SearchResult]) -> String {
     let mut out = String::new();
     for r in results {
-        let mut line_no = r.chunk.start_line;
-        for line in r.chunk.content.lines() {
+        for (line_no, line) in (r.chunk.start_line..).zip(r.chunk.content.lines()) {
             out.push_str(&format!("{}:{}:{}\n", r.chunk.file_path, line_no, line));
-            line_no += 1;
         }
     }
     out
@@ -353,10 +347,7 @@ mod tests {
 
     #[test]
     fn jsonl_one_object_per_line() {
-        let results = vec![
-            r("a.rs", 1, 5, 0.9, "x"),
-            r("b.rs", 10, 20, 0.4, "y"),
-        ];
+        let results = vec![r("a.rs", 1, 5, 0.9, "x"), r("b.rs", 10, 20, 0.4, "y")];
         let out = render(OutputFormat::Jsonl, "h", &results);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines.len(), 2);
@@ -369,7 +360,10 @@ mod tests {
     fn parse_aliases() {
         assert_eq!("rg".parse::<OutputFormat>().unwrap(), OutputFormat::Ripgrep);
         assert_eq!("md".parse::<OutputFormat>().unwrap(), OutputFormat::Pretty);
-        assert_eq!("ndjson".parse::<OutputFormat>().unwrap(), OutputFormat::Jsonl);
+        assert_eq!(
+            "ndjson".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Jsonl
+        );
         assert!("xml".parse::<OutputFormat>().is_err());
     }
 }

@@ -9,12 +9,7 @@ use veles_core::types::SearchResult;
 use crate::format::{self, OutputFormat};
 
 /// Render search results in the chosen format and write to stdout.
-pub fn emit_results(
-    format: OutputFormat,
-    header: &str,
-    what: &str,
-    results: &[SearchResult],
-) {
+pub fn emit_results(format: OutputFormat, header: &str, what: &str, results: &[SearchResult]) {
     if results.is_empty() {
         emit_empty(format, what);
         return;
@@ -24,12 +19,7 @@ pub fn emit_results(
 }
 
 /// Render symbols in the chosen format and write to stdout.
-pub fn emit_symbols(
-    format: OutputFormat,
-    header: &str,
-    what: &str,
-    symbols: &[&Symbol],
-) {
+pub fn emit_symbols(format: OutputFormat, header: &str, what: &str, symbols: &[&Symbol]) {
     if symbols.is_empty() {
         emit_empty(format, what);
         return;

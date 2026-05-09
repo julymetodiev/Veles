@@ -20,8 +20,7 @@ use std::sync::LazyLock;
 // Note: camelCase splitting in `split_camel_into` operates on ASCII bytes and
 // simply emits the whole-token form for non-ASCII identifiers (we don't try to
 // split scripts whose case-folding semantics differ from ASCII).
-static TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\p{L}_][\p{L}\p{N}_]*").unwrap());
+static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}_][\p{L}\p{N}_]*").unwrap());
 
 /// Split an ASCII identifier into camelCase/PascalCase sub-tokens.
 ///

@@ -43,10 +43,10 @@ pub fn render(f: &mut Frame, app: &mut App) {
     let layout = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),  // top bar
-            Constraint::Length(3),  // query box
-            Constraint::Min(5),     // body
-            Constraint::Length(1),  // keys hint
+            Constraint::Length(1), // top bar
+            Constraint::Length(3), // query box
+            Constraint::Min(5),    // body
+            Constraint::Length(1), // keys hint
         ])
         .split(area);
 
@@ -161,7 +161,10 @@ fn render_query(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(block, area);
 
     // Prompt mark, then query, with cursor placed with f.set_cursor_position.
-    let prompt = Span::styled(" ❯ ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD));
+    let prompt = Span::styled(
+        " ❯ ",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    );
     let query_span = if app.query.is_empty() {
         Span::styled(
             "type to search · ↑↓ navigate · Tab cycle mode · ? help",
@@ -176,8 +179,7 @@ fn render_query(f: &mut Frame, area: Rect, app: &App) {
     // Cursor position: prompt is " ❯ " (3 visual cols), then the query up
     // to cursor_chars.
     let prompt_cols: u16 = 3;
-    let cursor_col = prompt_cols
-        + visual_width_chars(&app.query, app.cursor_chars) as u16;
+    let cursor_col = prompt_cols + visual_width_chars(&app.query, app.cursor_chars) as u16;
     let cx = inner.x + cursor_col.min(inner.width.saturating_sub(1));
     let cy = inner.y;
     f.set_cursor_position(Position { x: cx, y: cy });
@@ -310,10 +312,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
                 Style::default().fg(TEXT)
             }),
         ));
-        spans.push(Span::styled(
-            "  ".to_string(),
-            row_style(Style::default()),
-        ));
+        spans.push(Span::styled("  ".to_string(), row_style(Style::default())));
         spans.push(Span::styled(
             score_text,
             row_style(
@@ -322,10 +321,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
         ));
-        spans.push(Span::styled(
-            "  ".to_string(),
-            row_style(Style::default()),
-        ));
+        spans.push(Span::styled("  ".to_string(), row_style(Style::default())));
         spans.push(Span::styled(
             snippet.to_string(),
             row_style(Style::default().fg(FAINT)),
@@ -388,10 +384,7 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
                 Style::default().fg(FAINT),
             ),
             match r.chunk.language.as_deref() {
-                Some(lang) => Span::styled(
-                    format!("  ·  {lang} "),
-                    Style::default().fg(FAINT),
-                ),
+                Some(lang) => Span::styled(format!("  ·  {lang} "), Style::default().fg(FAINT)),
                 None => Span::raw(" "),
             },
         ]),

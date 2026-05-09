@@ -221,8 +221,7 @@ const PYTHON_QUERY: &str = r#"
 (function_definition name: (identifier) @name) @def
 (class_definition name: (identifier) @name) @def
 "#;
-const PYTHON_KINDS: &[Option<SymbolKind>] =
-    &[Some(SymbolKind::Function), Some(SymbolKind::Class)];
+const PYTHON_KINDS: &[Option<SymbolKind>] = &[Some(SymbolKind::Function), Some(SymbolKind::Class)];
 
 const JAVASCRIPT_QUERY: &str = r#"
 (function_declaration name: (identifier) @name) @def

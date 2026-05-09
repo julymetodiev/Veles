@@ -57,11 +57,7 @@ pub fn spawn_worker(
         .expect("spawn veles-tui-search thread")
 }
 
-fn worker_loop(
-    index: Arc<VelesIndex>,
-    cmd_rx: Receiver<WorkerCmd>,
-    msg_tx: Sender<WorkerMsg>,
-) {
+fn worker_loop(index: Arc<VelesIndex>, cmd_rx: Receiver<WorkerCmd>, msg_tx: Sender<WorkerMsg>) {
     while let Ok(mut cmd) = cmd_rx.recv() {
         // Coalesce: pull any commands queued behind us and keep only the
         // newest. A `Shutdown` always wins so the worker tears down quickly.
@@ -96,11 +92,7 @@ fn worker_loop(
                     kind: ResultKind::Query,
                 }));
             }
-            WorkerCmd::Related {
-                seq,
-                source,
-                top_k,
-            } => {
+            WorkerCmd::Related { seq, source, top_k } => {
                 let started = Instant::now();
                 let anchor = format!("{}:{}", source.file_path, source.start_line);
                 let results = index.find_related(&source, top_k);

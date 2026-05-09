@@ -47,8 +47,7 @@ static EMBEDDED_SYMBOL_RE: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Token regex for natural-language stem boosts. Unicode-aware (matches
 /// Cyrillic / CJK / Greek / Arabic etc. in addition to ASCII).
-static TOKEN_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"[\p{L}_][\p{L}\p{N}_]*").unwrap());
+static TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\p{L}_][\p{L}\p{N}_]*").unwrap());
 
 /// Minimum stem length for prefix-based non-candidate scan.
 const EMBEDDED_STEM_MIN_LEN: usize = 4;
@@ -57,19 +56,40 @@ const EMBEDDED_SYMBOL_BOOST_SCALE: f64 = 0.5;
 
 /// Definition keywords across common languages.
 const DEFINITION_KEYWORDS: &[&str] = &[
-    "class", "module", "defmodule", "def", "interface", "struct", "enum",
-    "trait", "type", "func", "function", "object", "abstract class",
-    "data class", "fn", "fun", "package", "namespace", "protocol",
-    "record", "typedef",
+    "class",
+    "module",
+    "defmodule",
+    "def",
+    "interface",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "func",
+    "function",
+    "object",
+    "abstract class",
+    "data class",
+    "fn",
+    "fun",
+    "package",
+    "namespace",
+    "protocol",
+    "record",
+    "typedef",
     // Top-level bindings — covers Rust/C/C++/Go/JS/TS constants and globals.
     // Without these, queries for SCREAMING_SNAKE_CASE constants miss the
     // definition site entirely.
-    "const", "static",
+    "const",
+    "static",
 ];
 
 /// SQL DDL keywords.
 const SQL_DEFINITION_KEYWORDS: &[&str] = &[
-    "CREATE TABLE", "CREATE VIEW", "CREATE PROCEDURE", "CREATE FUNCTION",
+    "CREATE TABLE",
+    "CREATE VIEW",
+    "CREATE PROCEDURE",
+    "CREATE FUNCTION",
 ];
 
 /// Additive boost multiplier for chunks that define a queried symbol.
@@ -257,12 +277,7 @@ fn file_stem_lower(file_path: &str) -> String {
         .to_lowercase()
 }
 
-fn boost_symbol_definitions(
-    scores: &mut [f64],
-    query: &str,
-    max_score: f64,
-    chunks: &[Chunk],
-) {
+fn boost_symbol_definitions(scores: &mut [f64], query: &str, max_score: f64, chunks: &[Chunk]) {
     let symbol_name = extract_symbol_name(query);
     let trimmed = query.trim().to_string();
 
@@ -294,12 +309,7 @@ fn boost_symbol_definitions(
     }
 }
 
-fn boost_embedded_symbols(
-    scores: &mut [f64],
-    query: &str,
-    max_score: f64,
-    chunks: &[Chunk],
-) {
+fn boost_embedded_symbols(scores: &mut [f64], query: &str, max_score: f64, chunks: &[Chunk]) {
     let names: Vec<String> = EMBEDDED_SYMBOL_RE
         .find_iter(query)
         .map(|m| m.as_str().to_string())

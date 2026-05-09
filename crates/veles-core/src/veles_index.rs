@@ -137,10 +137,9 @@ impl VelesIndex {
 
     /// Persist the index to `<repo_root>/.veles/`.
     pub fn save(&self, repo_root: &Path) -> Result<()> {
-        let manifest = self
-            .manifest
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("Index has no manifest — cannot persist (was it built from a git URL?)"))?;
+        let manifest = self.manifest.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Index has no manifest — cannot persist (was it built from a git URL?)")
+        })?;
         persist::save(
             repo_root,
             manifest,
@@ -208,35 +207,32 @@ impl VelesIndex {
             bail!("Path is not a directory: {}", root.display());
         }
 
-        let manifest = self
-            .manifest
-            .as_ref()
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Index has no manifest — call `from_path` or `load` first"))?;
+        let manifest = self.manifest.as_ref().cloned().ok_or_else(|| {
+            anyhow::anyhow!("Index has no manifest — call `from_path` or `load` first")
+        })?;
 
         let exts = walker::filter_extensions(None, manifest.include_text_files);
 
         // Discover files currently on disk and their fingerprints (without
         // chunk_count — that's filled in after chunking).
-        let on_disk: HashMap<String, (PathBuf, u64, i64)> =
-            walker::walk_files(&root, &exts)
-                .filter_map(|abs_path| {
-                    let rel = abs_path
-                        .strip_prefix(&root)
-                        .ok()?
-                        .to_string_lossy()
-                        .into_owned();
-                    let meta = std::fs::metadata(&abs_path).ok()?;
-                    let mtime = meta
-                        .modified()
-                        .ok()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    Some((rel, (abs_path, meta.len(), mtime)))
-                })
-                .collect();
+        let on_disk: HashMap<String, (PathBuf, u64, i64)> = walker::walk_files(&root, &exts)
+            .filter_map(|abs_path| {
+                let rel = abs_path
+                    .strip_prefix(&root)
+                    .ok()?
+                    .to_string_lossy()
+                    .into_owned();
+                let meta = std::fs::metadata(&abs_path).ok()?;
+                let mtime = meta
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                Some((rel, (abs_path, meta.len(), mtime)))
+            })
+            .collect();
 
         // Classify files: unchanged / modified / added / removed.
         let mut unchanged: Vec<String> = Vec::new();
@@ -283,8 +279,10 @@ impl VelesIndex {
         // Reuse embeddings of unchanged chunks (rows of the dense matrix —
         // already L2-normalised; re-normalising is a no-op).
         let kept_embeddings = self.dense_index.extract_rows(&keep_indices);
-        let kept_chunks: Vec<Chunk> =
-            keep_indices.iter().map(|&i| self.chunks[i].clone()).collect();
+        let kept_chunks: Vec<Chunk> = keep_indices
+            .iter()
+            .map(|&i| self.chunks[i].clone())
+            .collect();
 
         // Keep the symbols belonging to unchanged files; the rest get
         // re-extracted in lock-step with re-chunking.
@@ -559,8 +557,7 @@ fn collect_chunks_and_symbols(
             let chunk_path = file_path.strip_prefix(display_root).unwrap_or(file_path);
             let chunk_path_str = chunk_path.to_string_lossy().into_owned();
 
-            let chunks =
-                chunker::chunk_source(&content, &chunk_path_str, language.as_deref());
+            let chunks = chunker::chunk_source(&content, &chunk_path_str, language.as_deref());
             let syms = match language.as_deref() {
                 Some(lang) if symbols::supports(lang) => {
                     symbols::extract_symbols(&content, &chunk_path_str, lang)
