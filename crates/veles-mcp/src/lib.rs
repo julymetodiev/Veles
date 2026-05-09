@@ -19,6 +19,11 @@
 //!   matters.
 //! - `refs` — definitions plus BM25 hits for a symbol name. One call
 //!   to answer both "where is X defined" and "where is X used".
+//! - `stats` — file count, chunk count, model metadata, and per-language
+//!   chunk breakdown for the indexed repo.
+//! - `update` — incrementally refresh the index against the current
+//!   state of disk (re-embed only fingerprint-changed files) and
+//!   persist to `<repo>/.veles/`. Local repos only.
 //! - `find_related` — semantically similar chunks for a `(file, line)`
 //!   pair returned by an earlier `search`.
 //!
@@ -219,6 +224,32 @@ fn tools() -> Vec<Tool> {
             }),
         },
         Tool {
+            name: "stats".into(),
+            description: "Show what the index knows about a repo: total files and chunks, model and embedding dim, plus a per-language chunk breakdown. Useful for self-diagnosis when search results look thin.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path or https:// git URL."
+                    }
+                }
+            }),
+        },
+        Tool {
+            name: "update".into(),
+            description: "Refresh the index for `repo` against the current state of disk: re-embed only files whose (size, mtime) fingerprint changed, drop removed files, pick up new ones, and persist the result under `<repo>/.veles/`. Cheap after small edits. Not supported for https:// git URLs (re-run `search` to re-clone instead).".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "repo": {
+                        "type": "string",
+                        "description": "Local directory path."
+                    }
+                }
+            }),
+        },
+        Tool {
             name: "find_related".into(),
             description: "Find code chunks semantically similar to a specific location in a file. Use after `search` to explore related implementations or callers.".into(),
             input_schema: json!({
@@ -290,6 +321,18 @@ impl IndexCache {
 
         self.entries.insert(repo.to_string(), index);
         Ok(self.entries.get(repo).unwrap())
+    }
+
+    /// Like [`Self::get_or_index`] but returns an exclusive borrow so the
+    /// caller can mutate the index (e.g. via `update_from_path`).
+    fn get_or_index_mut(
+        &mut self,
+        repo: &str,
+        include_text_files: bool,
+    ) -> Result<&mut VelesIndex> {
+        // Reuse the immutable path to populate the cache, then re-borrow mut.
+        let _ = self.get_or_index(repo, include_text_files)?;
+        Ok(self.entries.get_mut(repo).unwrap())
     }
 }
 
@@ -425,6 +468,8 @@ impl McpServer {
             "defs" => self.handle_defs(arguments).await,
             "symbols" => self.handle_symbols(arguments).await,
             "refs" => self.handle_refs(arguments).await,
+            "stats" => self.handle_stats(arguments).await,
+            "update" => self.handle_update(arguments).await,
             _ => Err(JsonRpcError {
                 code: -32602,
                 message: format!("Unknown tool: {tool_name}"),
@@ -618,6 +663,107 @@ impl McpServer {
 
         Ok(json!({
             "content": [{"type": "text", "text": lines.join("\n")}]
+        }))
+    }
+
+    async fn handle_stats(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let repo = args["repo"].as_str().unwrap_or(".");
+
+        let mut cache = self.cache.lock().await;
+        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
+            code: -32000,
+            message: e.to_string(),
+        })?;
+
+        let stats = index.stats();
+        let manifest = index.manifest();
+
+        let mut lines: Vec<String> = vec![format!("Index for {repo}"), String::new()];
+        lines.push(format!("Files:         {}", stats.indexed_files));
+        lines.push(format!("Chunks:        {}", stats.total_chunks));
+        if let Some(m) = manifest {
+            lines.push(format!("Model:         {}", m.model_name));
+            lines.push(format!("Embedding dim: {}", m.embedding_dim));
+            lines.push(format!("Format:        v{}", m.format_version));
+            lines.push(format!("Text files:    {}", m.include_text_files));
+        }
+
+        if !stats.languages.is_empty() {
+            lines.push(String::new());
+            lines.push("Languages (chunks):".to_string());
+            let mut langs: Vec<(&String, &usize)> = stats.languages.iter().collect();
+            langs.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+            let width = langs.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+            for (lang, count) in langs {
+                lines.push(format!("  {lang:<width$}  {count}"));
+            }
+        }
+
+        Ok(json!({
+            "content": [{"type": "text", "text": lines.join("\n")}]
+        }))
+    }
+
+    async fn handle_update(&self, args: Value) -> Result<Value, JsonRpcError> {
+        let repo = args["repo"].as_str().unwrap_or(".");
+        if repo.starts_with("https://") || repo.starts_with("http://") {
+            return Err(JsonRpcError {
+                code: -32000,
+                message: "Cannot update a remote git URL — re-run `search` against it to re-clone."
+                    .into(),
+            });
+        }
+        let path = Path::new(repo);
+        if !path.is_dir() {
+            return Err(JsonRpcError {
+                code: -32000,
+                message: format!("Path is not a directory: {repo}"),
+            });
+        }
+        let path_buf = path.to_path_buf();
+
+        let mut cache = self.cache.lock().await;
+        let index = cache
+            .get_or_index_mut(repo, false)
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+
+        let started = std::time::Instant::now();
+        let report = index
+            .update_from_path(&path_buf)
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let secs = started.elapsed().as_secs_f64();
+
+        let text = if report.is_noop() {
+            format!(
+                "Index is up to date in {secs:.2}s ({} chunks, no file changes detected).",
+                report.total_chunks
+            )
+        } else {
+            // Persist only when something actually changed.
+            index.save(&path_buf).map_err(|e| JsonRpcError {
+                code: -32000,
+                message: format!("update applied in memory but save failed: {e}"),
+            })?;
+            format!(
+                "Updated in {secs:.2}s — +{} added, ~{} modified, -{} removed (kept {} chunks, embedded {} new, total {}). Persisted to {}/.veles.",
+                report.added_files,
+                report.modified_files,
+                report.removed_files,
+                report.kept_chunks,
+                report.new_chunks,
+                report.total_chunks,
+                repo,
+            )
+        };
+
+        Ok(json!({
+            "content": [{"type": "text", "text": text}]
         }))
     }
 
