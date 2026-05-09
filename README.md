@@ -49,6 +49,9 @@ curl --proto '=https' --tlsv1.2 -LsSf \
 # Windows — PowerShell
 irm https://github.com/julymetodiev/Veles/releases/latest/download/veles-cli-installer.ps1 | iex
 
+# Homebrew (macOS / Linux)
+brew install julymetodiev/tap/veles-cli
+
 # From crates.io (compiles locally; no protoc / extra deps needed)
 cargo install veles-cli
 
@@ -57,7 +60,7 @@ gh release download --repo julymetodiev/Veles --pattern '*linux-gnu*'   # or bro
 #   https://github.com/julymetodiev/Veles/releases/latest
 
 # Verify (optional)
-veles --version    # → veles 0.2.0
+veles --version    # → veles 0.2.1
 ```
 
 See **[INSTALL.md](INSTALL.md)** for SHA-256 verification and other
