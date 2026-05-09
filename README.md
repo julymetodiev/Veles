@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".assets/veles.png" alt="Veles" width="320">
+  <img src=".assets/veles-banner.png" alt="Veles" width="640">
 </p>
 
 # Veles
