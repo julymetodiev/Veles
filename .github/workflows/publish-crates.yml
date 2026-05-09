@@ -1,6 +1,11 @@
 # Custom cargo-dist publish job: pushes the four library crates to crates.io
 # in dependency order. Triggered by release.yml after the GitHub Release
-# artifacts have been uploaded and the homebrew job has run.
+# artifacts have been uploaded.
+#
+# Idempotent: each crate is checked against crates.io's API before
+# publishing, so re-running this workflow on a tag whose crates are already
+# published (e.g. when a release was bootstrapped manually, or when the
+# workflow is retried after a partial failure) is a no-op.
 #
 # Required secrets:
 #   CARGO_REGISTRY_TOKEN  — crates.io API token with publish scope
@@ -28,8 +33,6 @@ jobs:
       - name: Install Rust
         run: rustup update stable --no-self-update && rustup default stable
 
-      # Cache the registry index so the four sequential publishes don't
-      # each re-fetch metadata.
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -38,25 +41,28 @@ jobs:
             ~/.cargo/registry/cache/
           key: cargo-registry-${{ hashFiles('**/Cargo.lock') }}
 
-      # Publish in dependency order. cargo publish (1.85+) waits for the
-      # crate to be available on the index before returning, so the next
-      # `cargo publish` can resolve it as a registry dep.
-      - name: Publish veles-core
+      - name: Publish in dependency order (idempotent)
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p veles-core
+        run: |
+          set -euo pipefail
 
-      - name: Publish veles-grpc
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p veles-grpc
+          # Skip-or-publish: query crates.io's HTTP API for the (crate, version)
+          # tuple. 200 OK → already published, skip. 404 → publish.
+          publish_if_new() {
+            local crate="$1"
+            local version
+            version=$(cargo pkgid -p "$crate" | sed -E 's/.*[#@]//')
+            if curl -sf -o /dev/null \
+                "https://crates.io/api/v1/crates/${crate}/${version}"; then
+              echo "✓ ${crate} ${version} already on crates.io — skipping"
+            else
+              echo "→ Publishing ${crate} ${version}"
+              cargo publish -p "${crate}"
+            fi
+          }
 
-      - name: Publish veles-mcp
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p veles-mcp
-
-      - name: Publish veles-cli
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p veles-cli
+          publish_if_new veles-core
+          publish_if_new veles-grpc
+          publish_if_new veles-mcp
+          publish_if_new veles-cli

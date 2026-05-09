@@ -12,8 +12,11 @@ ci = "github"
 # Installers generated alongside the platform tarballs.
 # - shell:      `curl … | sh` for Linux / macOS
 # - powershell: `irm … | iex`  for Windows
-# - homebrew:   formula auto-published to the tap below
-installers = ["shell", "powershell", "homebrew"]
+#
+# `homebrew` is intentionally omitted until the `julymetodiev/homebrew-veles`
+# tap repo + `HOMEBREW_TAP_TOKEN` secret are set up. Re-add it to enable
+# auto-publish of the formula.
+installers = ["shell", "powershell"]
 
 # Target triples to build for. Linux uses musl so the binary is statically
 # linked and runs on any glibc / musl distribution.
@@ -25,16 +28,12 @@ targets = [
     "x86_64-pc-windows-msvc",
 ]
 
-# Homebrew tap repo (must already exist as `julymetodiev/homebrew-veles`).
-# cargo-dist opens a PR / pushes a commit there with an updated formula
-# whenever a new release is published.
-tap = "julymetodiev/homebrew-veles"
-
-# Publish jobs run after the release artifacts are uploaded. `homebrew`
-# is built into cargo-dist; `./publish-crates` is a custom job defined
-# in .github/workflows/publish-crates.yml that pushes the four library
-# crates (in dependency order) to crates.io.
-publish-jobs = ["homebrew", "./publish-crates"]
+# Publish jobs run after the release artifacts are uploaded.
+# `./publish-crates` is a custom workflow that pushes the four library
+# crates (in dependency order) to crates.io. The job is idempotent —
+# already-published versions are skipped, so re-running on the same tag
+# is safe.
+publish-jobs = ["./publish-crates"]
 
 # On pull requests, only run `dist plan` (validates config without
 # building). Full multi-platform builds run only on tag push.
