@@ -105,8 +105,17 @@ veles serve-grpc --addr "[::1]:50051"          # gRPC
 ### Shell integration
 
 ```sh
+mkdir -p ~/.zfunc ~/.local/share/man/man1
 veles completions zsh > ~/.zfunc/_veles
-veles man > ~/.local/share/man/man1/veles.1
+veles man              > ~/.local/share/man/man1/veles.1
+```
+
+Then once in `~/.zshrc`:
+
+```sh
+fpath=(~/.zfunc $fpath)
+autoload -Uz compinit && compinit
+export MANPATH="$HOME/.local/share/man:$MANPATH"
 ```
 
 ### Remote repos
