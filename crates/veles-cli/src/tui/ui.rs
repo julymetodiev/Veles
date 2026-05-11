@@ -4,8 +4,6 @@
 //! it needs to clamp scroll offsets to the actual viewport) and writes
 //! widgets into the frame. No I/O, no channel work, no state machines.
 
-use std::path::Path;
-
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -66,7 +64,7 @@ fn render_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let bar_style = Style::default().bg(HEADER_BG).fg(TEXT);
     f.render_widget(Block::default().style(bar_style), area);
 
-    let repo = repo_short(&app.repo_path);
+    let repo = app.repo_short.as_str();
     let stats = format!("{} chunks · {} files", app.total_chunks, app.total_files);
 
     let left_spans = vec![
@@ -79,7 +77,7 @@ fn render_top_bar(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  ", Style::default().fg(FAINT).bg(HEADER_BG)),
-        Span::styled(repo, Style::default().fg(TEXT).bg(HEADER_BG)),
+        Span::styled(repo.to_string(), Style::default().fg(TEXT).bg(HEADER_BG)),
         Span::styled("  ·  ", Style::default().fg(FAINT).bg(HEADER_BG)),
         Span::styled(stats, Style::default().fg(FAINT).bg(HEADER_BG)),
     ];
@@ -307,17 +305,14 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // Clamp scroll offset to keep selected visible.
+    // Clamp scroll offset so the selected row stays visible. The
+    // viewport is only known after layout, so the renderer drives
+    // the clamp — the actual mutation lives on `App` for clarity.
     let viewport = inner.height as usize;
     if viewport == 0 {
         return;
     }
-    if app.selected < app.list_offset {
-        app.list_offset = app.selected;
-    }
-    if app.selected >= app.list_offset + viewport {
-        app.list_offset = app.selected + 1 - viewport;
-    }
+    app.clamp_list_offset(viewport);
     let end = (app.list_offset + viewport).min(app.results.len());
 
     // Give trailing text (scope label / snippet) more room: cap path
@@ -923,17 +918,6 @@ fn visual_width_chars(s: &str, char_idx: usize) -> usize {
         .take(char_idx)
         .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(0))
         .sum()
-}
-
-fn repo_short(p: &Path) -> String {
-    let s = p.display().to_string();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy().into_owned();
-        if let Some(rest) = s.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
-    }
-    s
 }
 
 fn spinner_frame(tick: u64) -> &'static str {

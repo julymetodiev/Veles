@@ -30,7 +30,20 @@ const DEBOUNCE_MS: u64 = 20;
 const TOP_K: usize = 50;
 
 /// Cap how often the event loop wakes up when nothing is happening.
-const TICK_TIMEOUT_MS: u64 = 250;
+///
+/// crossterm's event::poll has no way to wake on a custom signal — the
+/// only way the search worker's "results ready" message reaches the UI
+/// thread is via the next poll cycle's `try_recv` drain. Keep this
+/// short enough that worker completions feel near-instant
+/// (≤ 1 frame at 60fps) while still letting the CPU sleep when the
+/// user isn't typing.
+const TICK_TIMEOUT_MS: u64 = 100;
+
+/// Tighter tick while a search is in flight — gives results a chance
+/// to land within ~one frame after the worker finishes. The cost is a
+/// few extra wakeups per second, but they're trivial: each wakeup
+/// runs `try_recv` (an atomic load) and re-renders the spinner.
+const SEARCHING_TICK_MS: u64 = 25;
 
 /// LRU bound for cached file contents used to render previews.
 const PREVIEW_FILE_CACHE: usize = 8;
@@ -54,6 +67,12 @@ pub enum ExitAction {
 
 pub struct App {
     pub repo_path: PathBuf,
+    /// Cached `~/relative/path` form of `repo_path`, computed once in
+    /// `App::new` instead of on every top-bar render. The home-prefix
+    /// lookup hits `std::env::var_os("HOME")` which is a syscall on
+    /// macOS — small, but it ran ~60 times/sec at the previous tick
+    /// rate for no reason.
+    pub repo_short: String,
     pub total_chunks: usize,
     pub total_files: usize,
     /// Shared with the search worker. Held here so the renderer can pull
@@ -121,8 +140,10 @@ impl App {
         msg_rx: Receiver<WorkerMsg>,
     ) -> Self {
         let scope_index = ScopeIndex::new(index.symbols());
+        let repo_short = shorten_with_home(&repo_path);
         Self {
             repo_path,
+            repo_short,
             total_files,
             total_chunks,
             index,
@@ -211,7 +232,7 @@ impl App {
             }
         }
         if self.searching {
-            ms = ms.min(80);
+            ms = ms.min(SEARCHING_TICK_MS);
         }
         if let Some((_, until)) = &self.status_msg {
             let now = Instant::now();
@@ -342,6 +363,13 @@ impl App {
         self.current_preview = path.and_then(|p| self.load_file(&p));
     }
 
+    /// Cache-or-read a preview file, returning its lines.
+    ///
+    /// Stays synchronous on purpose: every indexed file is ≤ 1MB
+    /// (filtered at walk time — see `walker::MAX_FILE_BYTES`), so a
+    /// cache miss is at most ~10ms on an SSD — well below 1 frame at
+    /// 60fps. An async refactor here would add a worker thread + a
+    /// channel + stale-load coalescing for a regression-class win.
     fn load_file(&mut self, rel: &str) -> Option<Arc<Vec<String>>> {
         if let Some(arc) = self.preview_cache.get(rel) {
             return Some(arc.clone());
@@ -444,6 +472,23 @@ impl App {
         self.preview_scroll = self.preview_scroll.saturating_add(delta);
     }
 
+    /// Adjust `list_offset` so `selected` stays inside the visible
+    /// window. Called from `render_results` once the actual viewport
+    /// height is known (it can only be computed after layout). Pure
+    /// mutation, no I/O — kept on `App` so the render path doesn't
+    /// have to touch state directly.
+    pub fn clamp_list_offset(&mut self, viewport: usize) {
+        if viewport == 0 {
+            return;
+        }
+        if self.selected < self.list_offset {
+            self.list_offset = self.selected;
+        }
+        if self.selected >= self.list_offset + viewport {
+            self.list_offset = self.selected + 1 - viewport;
+        }
+    }
+
     fn cycle_mode(&mut self, reverse: bool) {
         self.mode = if reverse {
             match self.mode {
@@ -497,15 +542,7 @@ impl App {
             return;
         }
         if by_word {
-            let chars: Vec<char> = self.query.chars().collect();
-            let mut i = self.cursor_chars;
-            while i > 0 && chars[i - 1].is_whitespace() {
-                i -= 1;
-            }
-            while i > 0 && !chars[i - 1].is_whitespace() {
-                i -= 1;
-            }
-            self.cursor_chars = i;
+            self.cursor_chars = word_boundary_left(&self.query, self.cursor_chars);
         } else {
             self.cursor_chars -= 1;
         }
@@ -517,15 +554,7 @@ impl App {
             return;
         }
         if by_word {
-            let chars: Vec<char> = self.query.chars().collect();
-            let mut i = self.cursor_chars;
-            while i < total && chars[i].is_whitespace() {
-                i += 1;
-            }
-            while i < total && !chars[i].is_whitespace() {
-                i += 1;
-            }
-            self.cursor_chars = i;
+            self.cursor_chars = word_boundary_right(&self.query, self.cursor_chars, total);
         } else {
             self.cursor_chars += 1;
         }
@@ -541,18 +570,11 @@ impl App {
         if self.cursor_chars == 0 {
             return;
         }
-        let chars: Vec<char> = self.query.chars().collect();
-        let mut i = self.cursor_chars;
-        while i > 0 && chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        while i > 0 && !chars[i - 1].is_whitespace() {
-            i -= 1;
-        }
-        let from = char_idx_to_byte(&self.query, i);
+        let target = word_boundary_left(&self.query, self.cursor_chars);
+        let from = char_idx_to_byte(&self.query, target);
         let to = char_idx_to_byte(&self.query, self.cursor_chars);
         self.query.replace_range(from..to, "");
-        self.cursor_chars = i;
+        self.cursor_chars = target;
         self.mark_query_changed();
     }
 
@@ -610,4 +632,70 @@ impl App {
 
 fn char_idx_to_byte(s: &str, idx: usize) -> usize {
     s.char_indices().nth(idx).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Render the path as `~/...` when it starts with `$HOME`. Same logic
+/// the previous `ui::repo_short` used; lifted here so it can be
+/// computed once at App construction time.
+fn shorten_with_home(p: &std::path::Path) -> String {
+    let s = p.display().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy().into_owned();
+        if let Some(rest) = s.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    s
+}
+
+/// Walk left from `cursor_chars` to the start of the current word.
+///
+/// Skips trailing whitespace first, then non-whitespace, matching
+/// readline `Meta-b` semantics. Equivalent to the prior `Vec<char>`
+/// implementation but allocation-free: forward-scan the prefix and
+/// record the start of every word transition; the final value is the
+/// nearest word-start at or before the cursor.
+fn word_boundary_left(s: &str, cursor_chars: usize) -> usize {
+    if cursor_chars == 0 {
+        return 0;
+    }
+    let mut last_word_start = 0usize;
+    let mut prev_was_ws = true;
+    for (i, c) in s.chars().take(cursor_chars).enumerate() {
+        if prev_was_ws && !c.is_whitespace() {
+            last_word_start = i;
+        }
+        prev_was_ws = c.is_whitespace();
+    }
+    last_word_start
+}
+
+/// Walk right from `cursor_chars` to the start of the next word.
+///
+/// Skips whitespace, then non-whitespace, matching readline `Meta-f`
+/// semantics. Uses a streaming iterator and bails when it crosses the
+/// cursor's target, so a long query doesn't pay full-string walks.
+fn word_boundary_right(s: &str, cursor_chars: usize, total: usize) -> usize {
+    if cursor_chars >= total {
+        return cursor_chars;
+    }
+    let mut iter = s.chars().skip(cursor_chars);
+    let mut i = cursor_chars;
+    // Skip whitespace.
+    while let Some(c) = iter.next() {
+        if !c.is_whitespace() {
+            // Already consumed one non-whitespace char — count it and
+            // fall through into the non-whitespace skip loop.
+            i += 1;
+            for c2 in iter.by_ref() {
+                if c2.is_whitespace() {
+                    return i;
+                }
+                i += 1;
+            }
+            return i;
+        }
+        i += 1;
+    }
+    i
 }
