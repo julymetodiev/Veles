@@ -9,7 +9,7 @@ use ahash::AHashMap;
 use ahash::AHashSet;
 use regex::Regex;
 use std::path::Path;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, RwLock};
 
 use crate::tokenizer::split_identifier;
 use crate::types::Chunk;
@@ -200,34 +200,100 @@ fn extract_symbol_name(query: &str) -> String {
     query.to_string()
 }
 
-fn definition_pattern(symbol_name: &str) -> (Regex, Regex) {
+/// A compiled definition matcher for a single symbol name.
+///
+/// Two regexes — `general` covers the curly-language `fn`/`struct`/`def`/...
+/// keywords, `sql` covers `CREATE TABLE`/`CREATE FUNCTION`/...  The pair
+/// is wrapped in an `Arc` and cached so we pay the regex compile cost
+/// (≈ ms per pattern) at most once per symbol name across the process
+/// lifetime — see [`DEF_PATTERN_CACHE`].
+#[derive(Debug)]
+pub(crate) struct DefPattern {
+    general: Regex,
+    sql: Regex,
+}
+
+impl DefPattern {
+    fn matches(&self, content: &str) -> bool {
+        self.general.is_match(content) || self.sql.is_match(content)
+    }
+}
+
+/// Pre-computed `|`-joined body of escaped general definition keywords.
+/// Identical for every symbol query, so we LazyLock it instead of
+/// rebuilding the join + the per-keyword `regex::escape` on every call.
+static DEF_KW_BODY: LazyLock<String> = LazyLock::new(|| {
+    DEFINITION_KEYWORDS
+        .iter()
+        .map(|k| regex::escape(k))
+        .collect::<Vec<_>>()
+        .join("|")
+});
+
+/// Same idea for SQL DDL keywords.
+static DEF_SQL_BODY: LazyLock<String> = LazyLock::new(|| {
+    SQL_DEFINITION_KEYWORDS
+        .iter()
+        .map(|k| regex::escape(k))
+        .collect::<Vec<_>>()
+        .join("|")
+});
+
+/// Process-wide cache of compiled `DefPattern`s keyed by symbol name.
+///
+/// `RwLock` so concurrent reads (cache hits) don't block each other —
+/// only the rare miss (first time we see a new symbol) takes the write
+/// path. The cache is unbounded: in practice users search for tens of
+/// distinct symbols per session, and each `DefPattern` is a few KB of
+/// regex DFA — bounded growth even on long-running MCP / gRPC servers.
+/// Switch to LRU if a session ever sustains thousands of unique symbol
+/// queries (it won't).
+static DEF_PATTERN_CACHE: LazyLock<RwLock<AHashMap<String, Arc<DefPattern>>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::with_capacity(64)));
+
+/// Get (or build, on first call) the `DefPattern` for `symbol_name`.
+///
+/// Returns `Arc<DefPattern>` so callers can fan out across many chunks
+/// without holding the cache lock and without cloning the underlying
+/// regexes (an `Arc::clone` is one atomic op).
+pub(crate) fn definition_pattern(symbol_name: &str) -> Arc<DefPattern> {
+    // Fast path: shared read lock, hit.
+    if let Ok(cache) = DEF_PATTERN_CACHE.read()
+        && let Some(p) = cache.get(symbol_name)
+    {
+        return Arc::clone(p);
+    }
+    // Slow path: compile outside the lock to avoid blocking other readers,
+    // then take a write lock and insert. Re-check under the write lock in
+    // case another thread compiled the same name concurrently.
+    let built = Arc::new(build_def_pattern(symbol_name));
+    let mut cache = DEF_PATTERN_CACHE.write().expect("DEF_PATTERN_CACHE poisoned");
+    if let Some(existing) = cache.get(symbol_name) {
+        return Arc::clone(existing);
+    }
+    cache.insert(symbol_name.to_string(), Arc::clone(&built));
+    built
+}
+
+fn build_def_pattern(symbol_name: &str) -> DefPattern {
     let escaped = regex::escape(symbol_name);
     let ns_prefix = r"(?:[A-Za-z_][A-Za-z0-9_]*(?:\.|::))*";
     let suffix = format!(r")\s+{ns_prefix}{escaped}(?:\s|[<({{\[:;]|$)");
-
-    let kw_body: String = DEFINITION_KEYWORDS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect::<Vec<_>>()
-        .join("|");
-    let sql_body: String = SQL_DEFINITION_KEYWORDS
-        .iter()
-        .map(|k| regex::escape(k))
-        .collect::<Vec<_>>()
-        .join("|");
 
     // The Rust `regex` crate does not support lookbehind, so we use `\b`
     // to require a word boundary before the keyword. All DEFINITION_KEYWORDS
     // start with a letter, so `\b` correctly distinguishes `class` from
     // `subclass` (no boundary inside the latter).
-    let general = Regex::new(&format!(r"\b(?:{kw_body}{suffix}")).unwrap();
-    let sql = Regex::new(&format!(r"(?i)\b(?:{sql_body}{suffix}")).unwrap();
-    (general, sql)
+    let general =
+        Regex::new(&format!(r"\b(?:{kw}{suffix}", kw = *DEF_KW_BODY)).expect("def general regex");
+    let sql = Regex::new(&format!(r"(?i)\b(?:{kw}{suffix}", kw = *DEF_SQL_BODY))
+        .expect("def sql regex");
+    DefPattern { general, sql }
 }
 
 /// A bundle of definition patterns for a set of symbol names.
 struct DefinitionMatchers {
-    patterns: Vec<(Regex, Regex)>,
+    patterns: Vec<Arc<DefPattern>>,
     names: Vec<String>,
 }
 
@@ -239,9 +305,7 @@ impl DefinitionMatchers {
     }
 
     fn defines_any(&self, content: &str) -> bool {
-        self.patterns
-            .iter()
-            .any(|(g, s)| g.is_match(content) || s.is_match(content))
+        self.patterns.iter().any(|p| p.matches(content))
     }
 }
 
@@ -519,9 +583,9 @@ mod tests {
         // searching for a top-level constant by name would never trigger
         // the definition boost, so its definition site got buried under
         // semantic noise even though BM25 ranked it correctly.
-        let (general, _) = definition_pattern("PREVIEW_FILE_CACHE");
-        assert!(general.is_match("const PREVIEW_FILE_CACHE: usize = 8;"));
-        assert!(general.is_match("static PREVIEW_FILE_CACHE: usize = 8;"));
+        let p = definition_pattern("PREVIEW_FILE_CACHE");
+        assert!(p.matches("const PREVIEW_FILE_CACHE: usize = 8;"));
+        assert!(p.matches("static PREVIEW_FILE_CACHE: usize = 8;"));
     }
 
     #[test]
@@ -529,15 +593,24 @@ mod tests {
         // Regression test: the previous regex used `(?<=\s)` lookbehind,
         // which the `regex` crate doesn't support. Compilation panicked
         // the moment a symbol query reached this code path.
-        let (general, sql) = definition_pattern("Manifest");
-        assert!(general.is_match("pub struct Manifest {"));
-        assert!(general.is_match("    fn Manifest() {}"));
+        let p = definition_pattern("Manifest");
+        assert!(p.matches("pub struct Manifest {"));
+        assert!(p.matches("    fn Manifest() {}"));
         // Word-boundary semantics: should not match "Manifest" inside an
         // unrelated keyword-like prefix.
-        assert!(!general.is_match("classManifest {"));
+        assert!(!p.matches("classManifest {"));
         // SQL pattern is case-insensitive on the keyword.
-        let (_, sql_lower) = definition_pattern("users");
-        assert!(sql_lower.is_match("create table users ("));
-        let _ = sql; // silence dead-code warning if branches drift.
+        let sql_lower = definition_pattern("users");
+        assert!(sql_lower.matches("create table users ("));
+    }
+
+    #[test]
+    fn definition_pattern_cache_returns_same_arc() {
+        // Two lookups for the same name must hit the cache and return
+        // the same `Arc`. Validates §1.3: we don't pay the regex
+        // compile cost twice for the same symbol.
+        let a = definition_pattern("CachedSymbol");
+        let b = definition_pattern("CachedSymbol");
+        assert!(Arc::ptr_eq(&a, &b), "cache miss — expected same Arc");
     }
 }
