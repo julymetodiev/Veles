@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.4"
+version = "0.4.5"
 edition = "2024"
 license = "MIT"
 authors = ["Julius Methody <julymetodiev@gmail.com>"]
@@ -46,9 +46,9 @@ bincode = "1.3"
 # Workspace crate deps. `version` is required by `cargo publish` so that
 # the published manifest can resolve siblings via crates.io after `path`
 # is stripped at publish time.
-veles-core = { path = "crates/veles-core", version = "0.4.4" }
-veles-grpc = { path = "crates/veles-grpc", version = "0.4.4" }
-veles-mcp = { path = "crates/veles-mcp", version = "0.4.4" }
+veles-core = { path = "crates/veles-core", version = "0.4.5" }
+veles-grpc = { path = "crates/veles-grpc", version = "0.4.5" }
+veles-mcp = { path = "crates/veles-mcp", version = "0.4.5" }
 
 # The profile that 'dist' will build with
 [profile.dist]
