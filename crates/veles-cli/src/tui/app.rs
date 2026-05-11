@@ -15,6 +15,7 @@ use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::Backend;
+use veles_core::scope::ScopeIndex;
 use veles_core::types::{SearchMode, SearchResult};
 
 use crate::tui::search::{ResultKind, SearchDone, WorkerCmd, WorkerMsg};
@@ -59,6 +60,11 @@ pub struct App {
     /// scope labels (`index.symbols()`) out of the same tree-sitter table
     /// the worker is searching against.
     pub index: Arc<veles_core::VelesIndex>,
+    /// Pre-built `file_path → symbol indices` lookup used by the render
+    /// loop to resolve scope labels in O(symbols_in_file) instead of
+    /// O(total_symbols) per row. Built once from `index.symbols()` and
+    /// reused for the lifetime of the TUI.
+    pub scope_index: ScopeIndex,
 
     // Query input.
     pub query: String,
@@ -80,6 +86,11 @@ pub struct App {
     pub elapsed_ms: u64,
     pub selected: usize,
     pub list_offset: usize,
+    /// User-driven scroll offset for the preview pane, in lines.
+    /// Positive scrolls down, negative scrolls up; reset to 0 whenever
+    /// the selection changes so the new chunk is shown from its
+    /// match-centred default window.
+    pub preview_scroll: i32,
 
     // Preview file cache (LRU). Files are usually small; we cache their
     // line splits so navigating between results in the same file is free.
@@ -109,11 +120,13 @@ impl App {
         cmd_tx: Sender<WorkerCmd>,
         msg_rx: Receiver<WorkerMsg>,
     ) -> Self {
+        let scope_index = ScopeIndex::new(index.symbols());
         Self {
             repo_path,
             total_files,
             total_chunks,
             index,
+            scope_index,
             query: String::new(),
             cursor_chars: 0,
             mode: SearchMode::Hybrid,
@@ -129,6 +142,7 @@ impl App {
             elapsed_ms: 0,
             selected: 0,
             list_offset: 0,
+            preview_scroll: 0,
             current_preview: None,
             current_preview_path: None,
             preview_cache: HashMap::new(),
@@ -228,6 +242,7 @@ impl App {
         self.elapsed_ms = done.elapsed_ms;
         self.selected = 0;
         self.list_offset = 0;
+        self.preview_scroll = 0;
         self.results_kind = match done.kind {
             ResultKind::Query => ResultsKind::Query { query: done.query },
             ResultKind::Related { anchor } => ResultsKind::Related { anchor },
@@ -353,6 +368,7 @@ impl App {
             return;
         }
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::Esc => self.quit = true,
             KeyCode::Char('c') if ctrl => self.quit = true,
@@ -363,6 +379,16 @@ impl App {
             KeyCode::Char('r') if ctrl => self.dispatch_related(),
             KeyCode::Char('d') if ctrl => self.dispatch_defs(),
             KeyCode::Char('f') if ctrl => self.dispatch_refs(),
+
+            // Preview scroll — checked BEFORE plain Up/Down so the
+            // shift-modified variants don't fall through to result
+            // navigation. Useful when the chunk is bigger than the
+            // viewport and you want to see the rest of it without
+            // changing selection.
+            KeyCode::Up if shift => self.scroll_preview(-1),
+            KeyCode::Down if shift => self.scroll_preview(1),
+            KeyCode::PageUp if shift => self.scroll_preview(-10),
+            KeyCode::PageDown if shift => self.scroll_preview(10),
 
             // Result navigation.
             KeyCode::Up => self.move_selected(-1),
@@ -403,7 +429,19 @@ impl App {
         }
         let max = self.results.len() as i32 - 1;
         let new = (self.selected as i32 + delta).clamp(0, max);
+        let changed = self.selected != new as usize;
         self.selected = new as usize;
+        if changed {
+            // New chunk → start from its match-centred default window.
+            self.preview_scroll = 0;
+        }
+    }
+
+    /// Scroll the preview pane up (`delta < 0`) or down (`delta > 0`) by
+    /// `delta` lines. The clamp lives in `render_preview` so the cap
+    /// adapts to the current viewport height and file length.
+    fn scroll_preview(&mut self, delta: i32) {
+        self.preview_scroll = self.preview_scroll.saturating_add(delta);
     }
 
     fn cycle_mode(&mut self, reverse: bool) {
