@@ -208,9 +208,9 @@ mod tests {
         ];
         let idx = ScopeIndex::new(&symbols);
         let chunks = [
-            chunk("a.rs", 1, 50),  // defines outer
-            chunk("a.rs", 40, 50), // in inner
-            chunk("b.rs", 1, 10),  // defines other
+            chunk("a.rs", 1, 50),    // defines outer
+            chunk("a.rs", 40, 50),   // in inner
+            chunk("b.rs", 1, 10),    // defines other
             chunk("a.rs", 200, 250), // nothing
             chunk("nonexistent.rs", 1, 5),
         ];

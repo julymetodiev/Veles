@@ -66,7 +66,7 @@ gh release download --repo julymetodiev/Veles --pattern '*linux-gnu*'   # or bro
 #   https://github.com/julymetodiev/Veles/releases/latest
 
 # Verify (optional)
-veles --version    # → veles 0.4.3
+veles --version    # → veles 0.5.0
 ```
 
 See **[INSTALL.md](INSTALL.md)** for SHA-256 verification and other

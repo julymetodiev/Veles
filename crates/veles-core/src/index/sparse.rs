@@ -147,11 +147,7 @@ impl Bm25Index {
     /// The scratch buffer can grow if a larger index runs on the same
     /// thread; it never shrinks. Peak per-thread memory is
     /// `8 × num_docs_max` bytes — 1.6MB for a 200K-chunk index.
-    fn score_sparse(
-        &self,
-        query_tokens: &[String],
-        selector: Option<&[usize]>,
-    ) -> Vec<(u32, f64)> {
+    fn score_sparse(&self, query_tokens: &[String], selector: Option<&[usize]>) -> Vec<(u32, f64)> {
         if self.num_docs == 0 || query_tokens.is_empty() {
             return Vec::new();
         }
@@ -284,10 +280,7 @@ impl Bm25Index {
         }
 
         let sparse = self.score_sparse(query_tokens, selector);
-        crate::index::topk::top_k_from_iter_f64(
-            sparse.into_iter().map(|(d, s)| (d as usize, s)),
-            k,
-        )
+        crate::index::topk::top_k_from_iter_f64(sparse.into_iter().map(|(d, s)| (d as usize, s)), k)
     }
 }
 

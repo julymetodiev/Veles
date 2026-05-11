@@ -114,7 +114,8 @@ impl DenseIndex {
             // copy_within handles non-overlapping or backward-overlap
             // safely; old_pos > new_pos guarantees non-overlap in our
             // direction.
-            self.matrix.copy_within(src_start..src_start + dim, dst_start);
+            self.matrix
+                .copy_within(src_start..src_start + dim, dst_start);
         }
 
         // Truncate to kept rows; append new ones; normalise just the appended slice.
@@ -125,7 +126,7 @@ impl DenseIndex {
             let copy = emb.len().min(dim);
             // Append row, padding with zeros if shorter than dim.
             self.matrix.extend_from_slice(&emb[..copy]);
-            self.matrix.extend(std::iter::repeat(0.0).take(dim - copy));
+            self.matrix.extend(std::iter::repeat_n(0.0, dim - copy));
         }
         self.n = kept + total_new;
 
@@ -351,11 +352,7 @@ mod tests {
     #[test]
     fn compact_and_extend_no_new() {
         // Compaction with no appended rows — just drop a row in the middle.
-        let mut index = DenseIndex::new(vec![
-            vec![1.0, 0.0],
-            vec![0.0, 1.0],
-            vec![0.7, 0.7],
-        ]);
+        let mut index = DenseIndex::new(vec![vec![1.0, 0.0], vec![0.0, 1.0], vec![0.7, 0.7]]);
         let kept2 = index.row(2).to_vec();
         index.compact_and_extend(&[0, 2], vec![]);
         assert_eq!(index.len(), 2);

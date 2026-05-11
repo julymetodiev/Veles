@@ -102,12 +102,13 @@ impl IndexCache {
         // Take or create the cell, update LRU timestamp. The shard lock
         // is held only for this `entry()` call — building runs outside.
         let cell = {
-            let entry = self.entries.entry(repo.to_string()).or_insert_with(|| {
-                CacheEntry {
+            let entry = self
+                .entries
+                .entry(repo.to_string())
+                .or_insert_with(|| CacheEntry {
                     cell: Arc::new(OnceCell::new()),
                     last_access: AtomicU64::new(0),
-                }
-            });
+                });
             entry.last_access.store(self.tick(), Ordering::Relaxed);
             entry.cell.clone()
         };

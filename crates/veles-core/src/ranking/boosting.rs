@@ -298,8 +298,8 @@ fn build_def_pattern(symbol_name: &str) -> DefPattern {
     // `subclass` (no boundary inside the latter).
     let general =
         Regex::new(&format!(r"\b(?:{kw}{suffix}", kw = *DEF_KW_BODY)).expect("def general regex");
-    let sql = Regex::new(&format!(r"(?i)\b(?:{kw}{suffix}", kw = *DEF_SQL_BODY))
-        .expect("def sql regex");
+    let sql =
+        Regex::new(&format!(r"(?i)\b(?:{kw}{suffix}", kw = *DEF_SQL_BODY)).expect("def sql regex");
     DefPattern { general, sql }
 }
 
