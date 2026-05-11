@@ -31,13 +31,17 @@ fn should_skip_search(query: &str, top_k: usize, chunks: &[Chunk]) -> bool {
     chunks.is_empty() || top_k == 0 || query.trim().is_empty()
 }
 
-/// Convert an ordered `(idx, raw_score)` ranking into RRF scores.
+/// Add RRF-scored contributions to `out` with a multiplicative weight.
 ///
-/// `out[idx] = 1 / (RRF_K + rank + 1)` for each ranked entry; remaining slots stay 0.0.
-fn fill_rrf(out: &mut [f64], ranked: &[(usize, f64)]) {
+/// `out[idx] += weight / (RRF_K + rank + 1)` for each ranked entry.
+/// Hybrid search uses this twice per query — once with `alpha_weight`
+/// for the semantic ranking and once with `1 - alpha_weight` for BM25
+/// — to blend both rankings into a single dense score vector without
+/// allocating one per-source intermediate (§1.2 of the perf plan).
+fn add_rrf_with_weight(out: &mut [f64], ranked: &[(usize, f64)], weight: f64) {
     for (rank, (idx, _)) in ranked.iter().enumerate() {
         if *idx < out.len() {
-            out[*idx] = 1.0 / (RRF_K + (rank + 1) as f64);
+            out[*idx] += weight / (RRF_K + (rank + 1) as f64);
         }
     }
 }
@@ -221,19 +225,15 @@ pub fn search_hybrid(
         bm25_index.top_k(&tokens, candidate_count, selector)
     };
 
-    let mut sem_rrf = vec![0.0f64; n];
-    fill_rrf(&mut sem_rrf, &sem_topk);
-    let mut bm25_rrf = vec![0.0f64; n];
-    fill_rrf(&mut bm25_rrf, &bm25_topk);
-
-    // Combine.
+    // Single dense score vector. The two RRF rankings are added in
+    // place with their alpha weights — no per-source `Vec<f64>` of
+    // length `n`, no full-N combine pass. Only the indices that appear
+    // in either top-k list (≈ candidate_count entries each) get
+    // touched; the rest stay at 0.0.
     let mut combined: Vec<f64> = vec![0.0f64; n];
-    for i in 0..n {
-        let s = sem_rrf[i];
-        let b = bm25_rrf[i];
-        if s > 0.0 || b > 0.0 {
-            combined[i] = alpha_weight * s + (1.0 - alpha_weight) * b;
-        }
+    add_rrf_with_weight(&mut combined, &sem_topk, alpha_weight);
+    if !bm25_topk.is_empty() {
+        add_rrf_with_weight(&mut combined, &bm25_topk, 1.0 - alpha_weight);
     }
 
     // Boost multi-chunk files, then apply query-type boosts.
@@ -267,13 +267,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fill_rrf() {
+    fn add_rrf_with_weight_basic() {
         let mut out = vec![0.0f64; 4];
         let ranked = vec![(2, 10.0), (0, 5.0)];
-        fill_rrf(&mut out, &ranked);
+        add_rrf_with_weight(&mut out, &ranked, 1.0);
         assert!(out[2] > out[0]); // higher raw score → lower rank → higher RRF
         assert_eq!(out[1], 0.0);
         assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn add_rrf_with_weight_scales_and_accumulates() {
+        // Two rankings into the same vector — the second call should
+        // *add* to the first, not overwrite. This is the property hybrid
+        // search relies on to fuse semantic + BM25 in one pass.
+        let mut out = vec![0.0f64; 3];
+        let sem = vec![(0, 1.0), (1, 0.5)];
+        let bm25 = vec![(1, 1.0), (2, 0.5)];
+        add_rrf_with_weight(&mut out, &sem, 0.5);
+        add_rrf_with_weight(&mut out, &bm25, 0.5);
+        assert!(out[0] > 0.0); // only in sem
+        assert!(out[2] > 0.0); // only in bm25
+        // Idx 1 is in both at rank 1 (sem) and rank 0 (bm25). Its score
+        // accumulates contributions from both.
+        assert!(out[1] > out[0]);
+        assert!(out[1] > out[2]);
     }
 
     fn dummy_chunk() -> Chunk {
