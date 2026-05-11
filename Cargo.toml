@@ -30,6 +30,7 @@ walkdir = "2"
 ignore = "0.4"            # gitignore-aware file walker (ripgrep's crate)
 globset = "0.4"           # glob path filter shared by CLI and MCP
 blake3 = "1"              # content-hash fallback for incremental update fingerprinting
+dashmap = "6"             # lockfree concurrent map: sharded internal locks, contention-free reads
 path-clean = "1"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
@@ -54,3 +55,11 @@ veles-mcp = { path = "crates/veles-mcp", version = "0.4.5" }
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+# Bench profile: match what users see from `cargo install veles-cli`.
+# `lto = "thin"` matches the dist profile; `codegen-units = 1` reduces
+# Criterion outlier variance at the cost of longer compile times.
+[profile.bench]
+inherits = "release"
+lto = "thin"
+codegen-units = 1

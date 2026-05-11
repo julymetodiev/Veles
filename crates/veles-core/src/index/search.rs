@@ -31,13 +31,17 @@ fn should_skip_search(query: &str, top_k: usize, chunks: &[Chunk]) -> bool {
     chunks.is_empty() || top_k == 0 || query.trim().is_empty()
 }
 
-/// Convert an ordered `(idx, raw_score)` ranking into RRF scores.
+/// Add RRF-scored contributions to `out` with a multiplicative weight.
 ///
-/// `out[idx] = 1 / (RRF_K + rank + 1)` for each ranked entry; remaining slots stay 0.0.
-fn fill_rrf(out: &mut [f64], ranked: &[(usize, f64)]) {
+/// `out[idx] += weight / (RRF_K + rank + 1)` for each ranked entry.
+/// Hybrid search uses this twice per query — once with `alpha_weight`
+/// for the semantic ranking and once with `1 - alpha_weight` for BM25
+/// — to blend both rankings into a single dense score vector without
+/// allocating one per-source intermediate (§1.2 of the perf plan).
+fn add_rrf_with_weight(out: &mut [f64], ranked: &[(usize, f64)], weight: f64) {
     for (rank, (idx, _)) in ranked.iter().enumerate() {
         if *idx < out.len() {
-            out[*idx] = 1.0 / (RRF_K + (rank + 1) as f64);
+            out[*idx] += weight / (RRF_K + (rank + 1) as f64);
         }
     }
 }
@@ -58,14 +62,21 @@ pub fn search_semantic(
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    let _span = tracing::trace_span!("search.semantic", top_k, n_chunks = chunks.len()).entered();
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
-    let query_embedding = model.encode(&[query.to_string()]);
+    let query_embedding = {
+        let _s = tracing::trace_span!("search.encode_query").entered();
+        model.encode(&[query.to_string()])
+    };
     let query_vec = &query_embedding[0];
 
     let candidate_count = top_k.saturating_mul(PURE_MODE_CANDIDATE_OVERSHOOT);
-    let (indices, similarities) = dense_index.query(query_vec, candidate_count, selector);
+    let (indices, similarities) = {
+        let _s = tracing::trace_span!("search.dense_query", candidate_count).entered();
+        dense_index.query(query_vec, candidate_count, selector)
+    };
 
     let mut scores = vec![0.0f64; chunks.len()];
     for (idx, sim) in indices.iter().zip(similarities.iter()) {
@@ -94,6 +105,7 @@ pub fn search_bm25(
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    let _span = tracing::trace_span!("search.bm25", top_k, n_chunks = chunks.len()).entered();
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
@@ -105,7 +117,10 @@ pub fn search_bm25(
     }
 
     let candidate_count = top_k.saturating_mul(PURE_MODE_CANDIDATE_OVERSHOOT);
-    let raw = bm25_index.top_k(&tokens, candidate_count, selector);
+    let raw = {
+        let _s = tracing::trace_span!("search.bm25_topk", n_tokens = tokens.len()).entered();
+        bm25_index.top_k(&tokens, candidate_count, selector)
+    };
 
     let mut scores = vec![0.0f64; chunks.len()];
     for (idx, score) in &raw {
@@ -144,9 +159,18 @@ fn finalize_pure_mode(
     top_k: usize,
     source: SearchMode,
 ) -> Vec<SearchResult> {
-    boost_multi_chunk_files(&mut scores, chunks);
-    apply_query_boost(&mut scores, query, chunks);
-    let ranked = rerank_topk(&scores, chunks, top_k, true);
+    {
+        let _s = tracing::trace_span!("search.boost_multi_chunk").entered();
+        boost_multi_chunk_files(&mut scores, chunks);
+    }
+    {
+        let _s = tracing::trace_span!("search.apply_query_boost").entered();
+        apply_query_boost(&mut scores, query, chunks);
+    }
+    let ranked = {
+        let _s = tracing::trace_span!("search.rerank_topk").entered();
+        rerank_topk(&scores, chunks, top_k, true)
+    };
     ranked
         .into_iter()
         .map(|(idx, score)| SearchResult {
@@ -169,6 +193,7 @@ pub fn search_hybrid(
     alpha: Option<f64>,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    let _span = tracing::trace_span!("search.hybrid", top_k, n_chunks = chunks.len()).entered();
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
@@ -177,8 +202,14 @@ pub fn search_hybrid(
     let n = chunks.len();
 
     // Semantic candidates → indexed RRF scores.
-    let query_emb = model.encode(&[query.to_string()]);
-    let (sem_idx, sem_sim) = dense_index.query(&query_emb[0], candidate_count, selector);
+    let query_emb = {
+        let _s = tracing::trace_span!("search.encode_query").entered();
+        model.encode(&[query.to_string()])
+    };
+    let (sem_idx, sem_sim) = {
+        let _s = tracing::trace_span!("search.dense_query", candidate_count).entered();
+        dense_index.query(&query_emb[0], candidate_count, selector)
+    };
     let sem_topk: Vec<(usize, f64)> = sem_idx
         .into_iter()
         .zip(sem_sim)
@@ -190,30 +221,36 @@ pub fn search_hybrid(
     let bm25_topk = if tokens.is_empty() {
         Vec::new()
     } else {
+        let _s = tracing::trace_span!("search.bm25_topk", n_tokens = tokens.len()).entered();
         bm25_index.top_k(&tokens, candidate_count, selector)
     };
 
-    let mut sem_rrf = vec![0.0f64; n];
-    fill_rrf(&mut sem_rrf, &sem_topk);
-    let mut bm25_rrf = vec![0.0f64; n];
-    fill_rrf(&mut bm25_rrf, &bm25_topk);
-
-    // Combine.
+    // Single dense score vector. The two RRF rankings are added in
+    // place with their alpha weights — no per-source `Vec<f64>` of
+    // length `n`, no full-N combine pass. Only the indices that appear
+    // in either top-k list (≈ candidate_count entries each) get
+    // touched; the rest stay at 0.0.
     let mut combined: Vec<f64> = vec![0.0f64; n];
-    for i in 0..n {
-        let s = sem_rrf[i];
-        let b = bm25_rrf[i];
-        if s > 0.0 || b > 0.0 {
-            combined[i] = alpha_weight * s + (1.0 - alpha_weight) * b;
-        }
+    add_rrf_with_weight(&mut combined, &sem_topk, alpha_weight);
+    if !bm25_topk.is_empty() {
+        add_rrf_with_weight(&mut combined, &bm25_topk, 1.0 - alpha_weight);
     }
 
     // Boost multi-chunk files, then apply query-type boosts.
-    boost_multi_chunk_files(&mut combined, chunks);
-    apply_query_boost(&mut combined, query, chunks);
+    {
+        let _s = tracing::trace_span!("search.boost_multi_chunk").entered();
+        boost_multi_chunk_files(&mut combined, chunks);
+    }
+    {
+        let _s = tracing::trace_span!("search.apply_query_boost").entered();
+        apply_query_boost(&mut combined, query, chunks);
+    }
 
     // Rerank top-k with path penalties + file saturation.
-    let ranked = rerank_topk(&combined, chunks, top_k, alpha_weight < 1.0);
+    let ranked = {
+        let _s = tracing::trace_span!("search.rerank_topk").entered();
+        rerank_topk(&combined, chunks, top_k, alpha_weight < 1.0)
+    };
 
     ranked
         .into_iter()
@@ -230,13 +267,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_fill_rrf() {
+    fn add_rrf_with_weight_basic() {
         let mut out = vec![0.0f64; 4];
         let ranked = vec![(2, 10.0), (0, 5.0)];
-        fill_rrf(&mut out, &ranked);
+        add_rrf_with_weight(&mut out, &ranked, 1.0);
         assert!(out[2] > out[0]); // higher raw score → lower rank → higher RRF
         assert_eq!(out[1], 0.0);
         assert_eq!(out[3], 0.0);
+    }
+
+    #[test]
+    fn add_rrf_with_weight_scales_and_accumulates() {
+        // Two rankings into the same vector — the second call should
+        // *add* to the first, not overwrite. This is the property hybrid
+        // search relies on to fuse semantic + BM25 in one pass.
+        let mut out = vec![0.0f64; 3];
+        let sem = vec![(0, 1.0), (1, 0.5)];
+        let bm25 = vec![(1, 1.0), (2, 0.5)];
+        add_rrf_with_weight(&mut out, &sem, 0.5);
+        add_rrf_with_weight(&mut out, &bm25, 0.5);
+        assert!(out[0] > 0.0); // only in sem
+        assert!(out[2] > 0.0); // only in bm25
+        // Idx 1 is in both at rank 1 (sem) and rank 0 (bm25). Its score
+        // accumulates contributions from both.
+        assert!(out[1] > out[0]);
+        assert!(out[1] > out[2]);
     }
 
     fn dummy_chunk() -> Chunk {

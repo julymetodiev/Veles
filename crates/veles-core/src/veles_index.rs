@@ -213,69 +213,44 @@ impl VelesIndex {
 
         let exts = walker::filter_extensions(None, manifest.include_text_files);
 
-        // Discover files currently on disk and their fingerprints (without
-        // chunk_count — that's filled in after chunking).
-        let on_disk: HashMap<String, (PathBuf, u64, i64)> = walker::walk_files(&root, &exts)
-            .filter_map(|abs_path| {
-                let rel = abs_path
-                    .strip_prefix(&root)
-                    .ok()?
-                    .to_string_lossy()
-                    .into_owned();
-                let meta = std::fs::metadata(&abs_path).ok()?;
-                let mtime = meta
-                    .modified()
-                    .ok()?
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0);
-                Some((rel, (abs_path, meta.len(), mtime)))
-            })
-            .collect();
+        // Walk the repo and classify every file in one place (§3.3).
+        // `classify_disk` lives in `persist` and is shared with the MCP
+        // status handler so both sides are guaranteed to agree on what
+        // counts as "modified" vs "mtime-only" vs "unchanged".
+        let state = persist::classify_disk(&root, &manifest, &exts);
 
-        // Classify files: unchanged / modified / added / removed.
-        //
-        // Fast path: matching (size, mtime) → unchanged without touching content.
-        // Slow path (only when fast path fails): if size matches and the
-        // previous manifest carries a BLAKE3 hash, hash the current bytes and
-        // compare. This catches `touch` / `git checkout` of an identical
-        // version / no-op formatter passes that drift the mtime without
-        // changing the bytes — saving an embedding round-trip.
+        // Re-derive the per-bucket Vec<String> the rest of this method
+        // already works with. Hashes computed during classification are
+        // hoisted out so we don't re-read the file when rebuilding the
+        // manifest below.
         let mut unchanged: Vec<String> = Vec::new();
         let mut modified: Vec<String> = Vec::new();
         let mut added: Vec<String> = Vec::new();
-        // Hashes we computed during classification, keyed by relative path.
-        // Reused when rebuilding the manifest to avoid re-reading the file.
         let mut computed_hashes: HashMap<String, String> = HashMap::new();
-
-        for (rel, (abs, size, mtime)) in &on_disk {
-            match manifest.files.get(rel) {
-                Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {
+        for (rel, cls) in &state.classification {
+            match cls {
+                persist::Classification::Unchanged => unchanged.push(rel.clone()),
+                persist::Classification::MtimeOnly { hash } => {
                     unchanged.push(rel.clone());
+                    computed_hashes.insert(rel.clone(), hash.clone());
                 }
-                Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
-                    match persist::content_hash(abs) {
-                        Ok(h) if Some(&h) == prev.content_hash.as_ref() => {
-                            unchanged.push(rel.clone());
-                            computed_hashes.insert(rel.clone(), h);
-                        }
-                        Ok(h) => {
-                            modified.push(rel.clone());
-                            computed_hashes.insert(rel.clone(), h);
-                        }
-                        Err(_) => modified.push(rel.clone()),
+                persist::Classification::Modified { hash } => {
+                    modified.push(rel.clone());
+                    if let Some(h) = hash {
+                        computed_hashes.insert(rel.clone(), h.clone());
                     }
                 }
-                Some(_) => modified.push(rel.clone()),
-                None => added.push(rel.clone()),
+                persist::Classification::Added => added.push(rel.clone()),
             }
         }
-        let removed: Vec<String> = manifest
-            .files
-            .keys()
-            .filter(|k| !on_disk.contains_key(*k))
-            .cloned()
+        let removed = state.removed.clone();
+        // Compact alias used below for absolute-path / size / mtime
+        // lookups. Built from `state.on_disk` so the rest of the
+        // method doesn't have to change.
+        let on_disk: HashMap<String, (PathBuf, u64, i64)> = state
+            .on_disk
+            .iter()
+            .map(|(k, e)| (k.clone(), (e.abs_path.clone(), e.size, e.mtime_secs)))
             .collect();
 
         // Fast path: no chunk-level changes. Two sub-cases:
@@ -338,6 +313,8 @@ impl VelesIndex {
         }
 
         // Build the keep set: indices of chunks belonging to unchanged files.
+        // Guaranteed sorted ascending because we iterate `self.chunks` in
+        // order — `DenseIndex::compact_and_extend` relies on this.
         let unchanged_set: HashSet<&str> = unchanged.iter().map(|s| s.as_str()).collect();
         let mut keep_indices: Vec<usize> = Vec::new();
         for (i, chunk) in self.chunks.iter().enumerate() {
@@ -345,14 +322,6 @@ impl VelesIndex {
                 keep_indices.push(i);
             }
         }
-
-        // Reuse embeddings of unchanged chunks (rows of the dense matrix —
-        // already L2-normalised; re-normalising is a no-op).
-        let kept_embeddings = self.dense_index.extract_rows(&keep_indices);
-        let kept_chunks: Vec<Chunk> = keep_indices
-            .iter()
-            .map(|&i| self.chunks[i].clone())
-            .collect();
 
         // Keep the symbols belonging to unchanged files; the rest get
         // re-extracted in lock-step with re-chunking.
@@ -407,34 +376,45 @@ impl VelesIndex {
             self.model.encode(&new_texts)
         };
 
-        // Combine kept + new.
-        let mut all_chunks = kept_chunks;
-        all_chunks.extend(new_chunks.iter().cloned());
-        let mut all_embeddings = kept_embeddings;
-        all_embeddings.extend(new_embeddings);
+        // Compact the existing dense matrix in place (§2.3): shift kept
+        // rows to the front in `keep_indices` order, truncate to that
+        // length, then append the freshly-embedded rows and L2-normalise
+        // only those. Replaces the previous extract→Vec<Vec>→DenseIndex::new
+        // round-trip (two full-corpus allocs + two copies).
+        self.dense_index
+            .compact_and_extend(&keep_indices, new_embeddings);
+
+        // Same in-place compaction for chunks: drop entries whose
+        // file_path is no longer in `unchanged_set`. `Vec::retain` does
+        // this without cloning the kept items.
+        self.chunks
+            .retain(|c| unchanged_set.contains(c.file_path.as_str()));
+        let new_chunks_count = new_chunks.len();
+        self.chunks.extend(new_chunks);
+
+        // Symbols are rebuilt from `kept_symbols + new_symbols` — the
+        // filter-cloned `kept_symbols` is already what we want.
         let mut all_symbols = kept_symbols;
         all_symbols.extend(new_symbols);
 
-        // Rebuild BM25 from full token set, dense from combined embeddings.
-        let bm25_index = build_bm25(&all_chunks);
-        let dense_index = DenseIndex::new(all_embeddings);
-        let (file_mapping, language_mapping) = build_mappings(&all_chunks);
+        // Rebuild BM25 + mappings from the now-current chunks vec.
+        let bm25_index = build_bm25(&self.chunks);
+        let (file_mapping, language_mapping) = build_mappings(&self.chunks);
 
         // Build a fresh manifest.
         let mut new_manifest = Manifest::new(
             &manifest.model_name,
-            self.dense_index.dim().max(dense_index.dim()),
+            self.dense_index.dim(),
             manifest.include_text_files,
         );
-        new_manifest.embedding_dim = dense_index.dim();
-        new_manifest.total_chunks = all_chunks.len();
+        new_manifest.embedding_dim = self.dense_index.dim();
+        new_manifest.total_chunks = self.chunks.len();
 
         // Per-file chunk counts for the new state.
         let mut chunk_counts: HashMap<&str, usize> = HashMap::new();
-        for c in &all_chunks {
+        for c in &self.chunks {
             *chunk_counts.entry(c.file_path.as_str()).or_default() += 1;
         }
-        let unchanged_set: HashSet<&str> = unchanged.iter().map(|s| s.as_str()).collect();
         for (rel, (abs, size, mtime)) in &on_disk {
             // Resolve a content hash for this file:
             //  - prefer the value we already computed during classification;
@@ -475,13 +455,11 @@ impl VelesIndex {
             removed_files: removed.len(),
             mtime_refreshed_files: 0,
             kept_chunks: keep_indices.len(),
-            new_chunks: new_chunks.len(),
-            total_chunks: all_chunks.len(),
+            new_chunks: new_chunks_count,
+            total_chunks: self.chunks.len(),
         };
 
-        self.chunks = all_chunks;
         self.bm25_index = bm25_index;
-        self.dense_index = dense_index;
         self.file_mapping = file_mapping;
         self.language_mapping = language_mapping;
         self.symbols = all_symbols;
@@ -601,10 +579,20 @@ impl VelesIndex {
     }
 
     /// Resolve a file path and line number to the containing chunk.
+    ///
+    /// Uses the pre-built `file_mapping` to scan only the chunks of the
+    /// target file rather than the whole corpus (§5.2 of the perf plan).
+    /// On a 200K-chunk repo with 5K files this turns an O(N) scan into
+    /// roughly O(chunks_per_file) — typically a handful.
     pub fn resolve_chunk(&self, file_path: &str, line: usize) -> Option<&Chunk> {
+        let indices = self.file_mapping.get(file_path)?;
         let mut fallback = None;
-        for chunk in &self.chunks {
-            if chunk.file_path == file_path && chunk.start_line <= line && line <= chunk.end_line {
+        for &i in indices {
+            let chunk = &self.chunks[i];
+            if chunk.start_line <= line && line <= chunk.end_line {
+                // The overlap window means a line on the boundary is in
+                // two chunks; prefer the one where the line is strictly
+                // inside (not the trailing edge).
                 if line < chunk.end_line {
                     return Some(chunk);
                 }
@@ -702,13 +690,35 @@ fn build_indexes(model: &StaticModel, chunks: &[Chunk]) -> (Bm25Index, DenseInde
 }
 
 /// Tokenize chunks (with path enrichment) and build a BM25 index.
+///
+/// Path tokens are computed **once per distinct file** and reused for
+/// every chunk of that file (§2.4 of the perf plan). A file with 50
+/// chunks used to pay 50× the path-split work — now it's a single
+/// tokenisation plus an extend per chunk.
 fn build_bm25(chunks: &[Chunk]) -> Bm25Index {
+    // Pre-compute path tokens per unique file path. Small map relative
+    // to chunk count (typically file_count ≈ chunks / 5). Done serially
+    // — the work is microseconds per file even on huge repos.
+    let mut path_tokens_by_file: HashMap<&str, Vec<String>> = HashMap::new();
+    for chunk in chunks {
+        path_tokens_by_file
+            .entry(chunk.file_path.as_str())
+            .or_insert_with(|| {
+                let mut tokens = Vec::new();
+                append_path_tokens(&chunk.file_path, &mut tokens);
+                tokens
+            });
+    }
+
     let tokenized: Vec<Vec<String>> = chunks
         .par_iter()
         .map(|chunk| {
-            let mut tokens: Vec<String> = Vec::with_capacity(64);
+            let path_tokens = path_tokens_by_file
+                .get(chunk.file_path.as_str())
+                .expect("path tokens pre-computed for every chunk's file_path");
+            let mut tokens: Vec<String> = Vec::with_capacity(64 + path_tokens.len());
             tokenize_into(&chunk.content, &mut tokens);
-            append_path_tokens(&chunk.file_path, &mut tokens);
+            tokens.extend(path_tokens.iter().cloned());
             tokens
         })
         .collect();

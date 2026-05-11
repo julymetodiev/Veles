@@ -313,7 +313,31 @@ pub fn language_for_path(path: &Path) -> Option<&'static str> {
     }
 }
 
+/// Pre-built extension set for "code only" — the default and most-used path.
+static CODE_EXTENSIONS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    FILE_TYPES
+        .iter()
+        .filter(|(_, ft)| ft.category == FileCategory::Code)
+        .map(|(ext, _)| (*ext).to_string())
+        .collect()
+});
+
+/// Pre-built extension set for code + text documents.
+static CODE_AND_DOC_EXTENSIONS: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    FILE_TYPES
+        .iter()
+        .map(|(ext, _)| (*ext).to_string())
+        .collect()
+});
+
 /// Build the set of file extensions to include based on parameters.
+///
+/// The two no-`extensions` paths are the overwhelmingly common case
+/// (CLI / MCP / gRPC all hit them) and used to rebuild the `HashSet`
+/// from scratch on every call. They now return a clone of a
+/// process-wide `LazyLock<HashSet<String>>` — the clone is still
+/// `O(n)` over ~35 extensions but skips the `FILE_TYPES` scan + the
+/// category-set construction (§5.3 of the perf plan).
 pub fn filter_extensions(
     extensions: Option<&HashSet<String>>,
     include_text_files: bool,
@@ -321,16 +345,11 @@ pub fn filter_extensions(
     if let Some(exts) = extensions {
         return exts.clone();
     }
-    let categories = if include_text_files {
-        HashSet::from([FileCategory::Code, FileCategory::Document])
+    if include_text_files {
+        CODE_AND_DOC_EXTENSIONS.clone()
     } else {
-        HashSet::from([FileCategory::Code])
-    };
-    FILE_TYPES
-        .iter()
-        .filter(|(_, ft)| categories.contains(&ft.category))
-        .map(|(ext, _)| ext.to_string())
-        .collect()
+        CODE_EXTENSIONS.clone()
+    }
 }
 
 /// Maximum file size to read and index (1 MB).

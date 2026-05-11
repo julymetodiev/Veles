@@ -1,45 +1,58 @@
 //! Path-based penalties — test file penalties, compat/legacy penalties, file saturation.
 
 use ahash::AHashMap;
-use regex::Regex;
+use regex::RegexSet;
 use std::sync::LazyLock;
 
 use crate::index::topk::top_k_indexed;
 use crate::types::Chunk;
 
-/// Test file patterns across common languages.
-static TEST_FILE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?:^|/)(?:\
-        test_[^/]*\.py|[^/]*_test\.py\
-        |[^/]*_test\.go\
-        |[^/]*Tests?\.java\
-        |[^/]*Test\.php\
-        |[^/]*_spec\.rb|[^/]*_test\.rb\
-        |[^/]*\.test\.[jt]sx?|[^/]*\.spec\.[jt]sx?\
-        |[^/]*Tests?\.kt|[^/]*Spec\.kt\
-        |[^/]*Tests?\.swift|[^/]*Spec\.swift\
-        |[^/]*Tests?\.cs\
-        |test_[^/]*\.cpp|[^/]*_test\.cpp|test_[^/]*\.c|[^/]*_test\.c\
-        |[^/]*Spec\.scala|[^/]*Suite\.scala|[^/]*Test\.scala\
-        |[^/]*_test\.dart|test_[^/]*\.dart\
-        |[^/]*_spec\.lua|[^/]*_test\.lua|test_[^/]*\.lua\
-        |test_helpers?[^/]*\.\w+\
-        )$",
-    )
-    .unwrap()
+/// Indices into [`PENALTY_SET`] — the order is load-bearing because
+/// each index maps to a specific penalty multiplier in
+/// [`file_path_penalty`]. Adding a pattern means appending here AND in
+/// the `RegexSet` body, in the same order.
+mod p {
+    pub const TEST_FILE: usize = 0;
+    pub const TEST_DIR: usize = 1;
+    pub const COMPAT_DIR: usize = 2;
+    pub const EXAMPLES_DIR: usize = 3;
+    pub const TYPE_DEFS: usize = 4;
+}
+
+/// One `RegexSet` over all path-penalty patterns (§5.1 of the perf
+/// plan). A single DFA scan returns the set of pattern indices that
+/// matched the file path; the previous code ran 5 independent
+/// `is_match` passes per file. `RegexSet` shares prefixes and the
+/// inner state machine, so even when no patterns match it walks the
+/// path once.
+static PENALTY_SET: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new([
+        // index 0 — TEST_FILE
+        r"(?:^|/)(?:test_[^/]*\.py|[^/]*_test\.py\
+            |[^/]*_test\.go\
+            |[^/]*Tests?\.java\
+            |[^/]*Test\.php\
+            |[^/]*_spec\.rb|[^/]*_test\.rb\
+            |[^/]*\.test\.[jt]sx?|[^/]*\.spec\.[jt]sx?\
+            |[^/]*Tests?\.kt|[^/]*Spec\.kt\
+            |[^/]*Tests?\.swift|[^/]*Spec\.swift\
+            |[^/]*Tests?\.cs\
+            |test_[^/]*\.cpp|[^/]*_test\.cpp|test_[^/]*\.c|[^/]*_test\.c\
+            |[^/]*Spec\.scala|[^/]*Suite\.scala|[^/]*Test\.scala\
+            |[^/]*_test\.dart|test_[^/]*\.dart\
+            |[^/]*_spec\.lua|[^/]*_test\.lua|test_[^/]*\.lua\
+            |test_helpers?[^/]*\.\w+)$",
+        // index 1 — TEST_DIR
+        r"(?:^|/)(?:tests?|__tests__|spec|testing)(?:/|$)",
+        // index 2 — COMPAT_DIR
+        r"(?:^|/)(?:compat|_compat|legacy)(?:/|$)",
+        // index 3 — EXAMPLES_DIR
+        r"(?:^|/)(?:_?examples?|docs?_src)(?:/|$)",
+        // index 4 — TYPE_DEFS
+        r"\.d\.ts$",
+    ])
+    .expect("penalty RegexSet must compile")
 });
-
-static TEST_DIR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|/)(?:tests?|__tests__|spec|testing)(?:/|$)").unwrap());
-
-static COMPAT_DIR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|/)(?:compat|_compat|legacy)(?:/|$)").unwrap());
-
-static EXAMPLES_DIR_RE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?:^|/)(?:_?examples?|docs?_src)(?:/|$)").unwrap());
-
-static TYPE_DEFS_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\.d\.ts$").unwrap());
 
 const STRONG_PENALTY: f64 = 0.3;
 const MODERATE_PENALTY: f64 = 0.5;
@@ -130,6 +143,11 @@ pub fn rerank_topk(
 }
 
 /// Return a combined multiplicative penalty for all applicable path patterns.
+///
+/// Single `RegexSet::matches` call instead of five independent
+/// `is_match` passes (§5.1). The set's compiled DFA shares prefix work
+/// across all five patterns and returns the set of matched indices in
+/// one path scan.
 fn file_path_penalty(file_path: &str) -> f64 {
     // Avoid a heap allocation on the common case (no backslashes).
     let normalised: std::borrow::Cow<'_, str> = if file_path.contains('\\') {
@@ -140,8 +158,18 @@ fn file_path_penalty(file_path: &str) -> f64 {
     let s: &str = &normalised;
     let mut penalty = 1.0;
 
-    if TEST_FILE_RE.is_match(s) || TEST_DIR_RE.is_match(s) {
+    let hits = PENALTY_SET.matches(s);
+    if hits.matched(p::TEST_FILE) || hits.matched(p::TEST_DIR) {
         penalty *= STRONG_PENALTY;
+    }
+    if hits.matched(p::COMPAT_DIR) {
+        penalty *= STRONG_PENALTY;
+    }
+    if hits.matched(p::EXAMPLES_DIR) {
+        penalty *= STRONG_PENALTY;
+    }
+    if hits.matched(p::TYPE_DEFS) {
+        penalty *= MILD_PENALTY;
     }
 
     let filename = std::path::Path::new(file_path)
@@ -150,16 +178,6 @@ fn file_path_penalty(file_path: &str) -> f64 {
         .unwrap_or("");
     if REEXPORT_FILENAMES.contains(&filename) {
         penalty *= MODERATE_PENALTY;
-    }
-
-    if COMPAT_DIR_RE.is_match(s) {
-        penalty *= STRONG_PENALTY;
-    }
-    if EXAMPLES_DIR_RE.is_match(s) {
-        penalty *= STRONG_PENALTY;
-    }
-    if TYPE_DEFS_RE.is_match(s) {
-        penalty *= MILD_PENALTY;
     }
 
     penalty

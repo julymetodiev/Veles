@@ -4,8 +4,6 @@
 //! it needs to clamp scroll offsets to the actual viewport) and writes
 //! widgets into the frame. No I/O, no channel work, no state machines.
 
-use std::path::Path;
-
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -66,7 +64,7 @@ fn render_top_bar(f: &mut Frame, area: Rect, app: &App) {
     let bar_style = Style::default().bg(HEADER_BG).fg(TEXT);
     f.render_widget(Block::default().style(bar_style), area);
 
-    let repo = repo_short(&app.repo_path);
+    let repo = app.repo_short.as_str();
     let stats = format!("{} chunks · {} files", app.total_chunks, app.total_files);
 
     let left_spans = vec![
@@ -79,7 +77,7 @@ fn render_top_bar(f: &mut Frame, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled("  ·  ", Style::default().fg(FAINT).bg(HEADER_BG)),
-        Span::styled(repo, Style::default().fg(TEXT).bg(HEADER_BG)),
+        Span::styled(repo.to_string(), Style::default().fg(TEXT).bg(HEADER_BG)),
         Span::styled("  ·  ", Style::default().fg(FAINT).bg(HEADER_BG)),
         Span::styled(stats, Style::default().fg(FAINT).bg(HEADER_BG)),
     ];
@@ -307,23 +305,32 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
         return;
     }
 
-    // Clamp scroll offset to keep selected visible.
+    // Clamp scroll offset so the selected row stays visible. The
+    // viewport is only known after layout, so the renderer drives
+    // the clamp — the actual mutation lives on `App` for clarity.
     let viewport = inner.height as usize;
     if viewport == 0 {
         return;
     }
-    if app.selected < app.list_offset {
-        app.list_offset = app.selected;
-    }
-    if app.selected >= app.list_offset + viewport {
-        app.list_offset = app.selected + 1 - viewport;
-    }
+    app.clamp_list_offset(viewport);
     let end = (app.list_offset + viewport).min(app.results.len());
 
     // Give trailing text (scope label / snippet) more room: cap path
     // padding at 40 cols rather than 60 so the right-hand label isn't
     // squeezed to nothing on terminals split 42/58 with a preview pane.
     let path_col = (inner.width as usize).saturating_sub(8 + 2 + 1).min(40); // budget for path
+
+    // Relative score colour palette: pick the max score in the current
+    // result set and colour each row against that. Hybrid scores are
+    // RRF-blended (max ≈ 0.02) while BM25 scores are unbounded — a
+    // single static threshold would either paint everything FAINT in
+    // hybrid mode or saturate everything HIGH in BM25.
+    let max_score = app
+        .results
+        .iter()
+        .map(|r| r.score)
+        .fold(f64::NEG_INFINITY, f64::max);
+
     let mut lines: Vec<Line> = Vec::with_capacity(end - app.list_offset);
     for idx in app.list_offset..end {
         let r = &app.results[idx];
@@ -341,7 +348,10 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
         // when available — it's a more reliable "what is this" signal than
         // the chunk's first non-blank line. Fall back to the snippet when
         // the chunk doesn't sit inside any recognised symbol.
-        let scope_label = veles_core::scope::chunk_scope_label(app.index.symbols(), &r.chunk);
+        //
+        // Uses the pre-built ScopeIndex for O(symbols_in_file) lookup
+        // instead of scanning the whole symbol table per row.
+        let scope_label = app.scope_index.label(app.index.symbols(), &r.chunk);
         let (trailing_text, trailing_is_scope) = match scope_label {
             Some(label) => (label, true),
             None => (first_nonblank_line(&r.chunk.content).to_string(), false),
@@ -375,7 +385,7 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
             score_text,
             row_style(
                 Style::default()
-                    .fg(score_color(r.score))
+                    .fg(score_color(r.score, max_score))
                     .add_modifier(Modifier::BOLD),
             ),
         ));
@@ -412,6 +422,11 @@ fn render_results(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn render_preview(f: &mut Frame, area: Rect, app: &App) {
+    let max_score = app
+        .results
+        .iter()
+        .map(|r| r.score)
+        .fold(f64::NEG_INFINITY, f64::max);
     let title = match app.results.get(app.selected) {
         Some(r) => Line::from(vec![
             Span::raw(" "),
@@ -427,7 +442,7 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
                 format!(" {:.3} ", r.score),
                 Style::default()
                     .fg(Color::Black)
-                    .bg(score_color(r.score))
+                    .bg(score_color(r.score, max_score))
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw(" "),
@@ -477,17 +492,25 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
 
     let lines: Vec<Line<'static>> = match &app.current_preview {
         Some(file_lines) if !file_lines.is_empty() => {
-            // Show 3 lines of context above the chunk + the chunk + the
-            // rest of the viewport budget below.
             let total = file_lines.len();
-            let context_above: usize = 3;
-            let start = chunk.start_line.saturating_sub(context_above).max(1);
-            let mut end = (start + viewport_h - 1).min(total);
-            // If the chunk is shorter than the viewport, prefer to show
-            // a few lines below it too.
-            if end < chunk.end_line + 3 {
-                end = (chunk.end_line + 3).min(total);
-            }
+
+            // Compute the window. The user-driven "preview_scroll" offset
+            // lets the reader pan ±viewport over the default window
+            // (Ctrl-J / Ctrl-K). The default window centers on the match
+            // line inside the chunk when one exists, otherwise it shows
+            // a few lines of context above chunk.start_line.
+            let anchor = find_match_line(chunk, &terms, file_lines).unwrap_or(chunk.start_line);
+            let default_start = compute_preview_start(chunk, anchor, viewport_h, total);
+
+            // Apply user scroll offset, clamped to file range.
+            let scroll = app.preview_scroll;
+            let start = if scroll >= 0 {
+                (default_start + scroll as usize).min(total.saturating_sub(viewport_h).max(1))
+            } else {
+                default_start.saturating_sub((-scroll) as usize).max(1)
+            };
+            let end = (start + viewport_h - 1).min(total);
+
             let mut out = Vec::with_capacity(end + 1 - start);
             for ln in start..=end {
                 let content = file_lines.get(ln - 1).map(String::as_str).unwrap_or("");
@@ -512,6 +535,71 @@ fn render_preview(f: &mut Frame, area: Rect, app: &App) {
 
     let p = Paragraph::new(lines);
     f.render_widget(p, inner);
+}
+
+/// First line inside `chunk.start_line..=chunk.end_line` whose content
+/// contains any of the current query terms (case-insensitive). Returns
+/// `None` for queries with no terms (Related view, or empty Defs/Refs)
+/// or when the preview file isn't loaded — caller falls back to
+/// `chunk.start_line`.
+fn find_match_line(
+    chunk: &veles_core::types::Chunk,
+    terms: &[String],
+    file_lines: &[String],
+) -> Option<usize> {
+    let lower_terms: Vec<String> = terms
+        .iter()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_ascii_lowercase())
+        .collect();
+    if lower_terms.is_empty() {
+        return None;
+    }
+    let total = file_lines.len();
+    let last = chunk.end_line.min(total);
+    for ln in chunk.start_line..=last {
+        let content = file_lines.get(ln - 1)?;
+        let lower = content.to_ascii_lowercase();
+        if lower_terms.iter().any(|t| lower.contains(t.as_str())) {
+            return Some(ln);
+        }
+    }
+    None
+}
+
+/// Pick the first line of the preview viewport.
+///
+/// Strategy:
+/// 1. Try the legacy default — 3 lines of context above `chunk.start_line`.
+/// 2. If that puts the match `anchor` line outside the viewport, scroll
+///    so the anchor lands roughly in the upper third (a third above,
+///    two thirds below) so the reader sees both context and the match.
+///
+/// Without this scroll, a chunk larger than the viewport (e.g. 50-line
+/// chunk in a 25-row terminal) hid matches near the end of the chunk
+/// entirely — the user's reported bug.
+fn compute_preview_start(
+    chunk: &veles_core::types::Chunk,
+    anchor: usize,
+    viewport_h: usize,
+    total: usize,
+) -> usize {
+    let context_above: usize = 3;
+    let default_start = chunk.start_line.saturating_sub(context_above).max(1);
+    let default_end = default_start + viewport_h.saturating_sub(1);
+
+    if anchor >= default_start && anchor <= default_end {
+        // Anchor is visible in the default window — keep it.
+        return default_start;
+    }
+
+    // Scroll so anchor sits ~1/3 into the viewport. Reserves 1/3 of the
+    // height for upward context, 2/3 for forward reading.
+    let upper_context = viewport_h / 3;
+    let proposed = anchor.saturating_sub(upper_context).max(1);
+    // Don't scroll past the end of the file.
+    let max_start = total.saturating_sub(viewport_h.saturating_sub(1)).max(1);
+    proposed.min(max_start)
 }
 
 fn render_welcome(f: &mut Frame, area: Rect, app: &App) {
@@ -589,7 +677,7 @@ fn render_keys(f: &mut Frame, area: Rect, app: &App) {
 
 fn render_help(f: &mut Frame, area: Rect) {
     let w = 64u16.min(area.width.saturating_sub(4));
-    let h = 26u16.min(area.height.saturating_sub(4));
+    let h = 30u16.min(area.height.saturating_sub(4));
     let x = area.x + (area.width.saturating_sub(w)) / 2;
     let y = area.y + (area.height.saturating_sub(h)) / 2;
     let modal = Rect {
@@ -621,6 +709,10 @@ fn render_help(f: &mut Frame, area: Rect) {
         section("Navigation"),
         kbd("↑ / ↓ · Ctrl-P / Ctrl-N", "select prev / next result"),
         kbd("PgUp / PgDn", "jump 10 results"),
+        Line::from(""),
+        section("Preview pane"),
+        kbd("Shift-↑ / Shift-↓", "scroll preview one line"),
+        kbd("Shift-PgUp / Shift-PgDn", "scroll preview 10 lines"),
         Line::from(""),
         section("Search mode"),
         kbd("Tab / Shift-Tab", "cycle hybrid · bm25 · semantic"),
@@ -828,17 +920,6 @@ fn visual_width_chars(s: &str, char_idx: usize) -> usize {
         .sum()
 }
 
-fn repo_short(p: &Path) -> String {
-    let s = p.display().to_string();
-    if let Some(home) = std::env::var_os("HOME") {
-        let home = home.to_string_lossy().into_owned();
-        if let Some(rest) = s.strip_prefix(&home) {
-            return format!("~{rest}");
-        }
-    }
-    s
-}
-
 fn spinner_frame(tick: u64) -> &'static str {
     SPINNER[(tick as usize) % SPINNER.len()]
 }
@@ -859,10 +940,24 @@ fn mode_label(mode: SearchMode) -> &'static str {
     }
 }
 
-fn score_color(score: f64) -> Color {
-    if score >= 0.7 {
+/// Pick a colour for a score against the current result set's maximum.
+///
+/// Relative thresholds: top ~70% gets HIGH, top ~40% MID, the rest
+/// FAINT. The previous absolute thresholds (`0.7` / `0.4`) made every
+/// hybrid result render FAINT — hybrid is RRF-blended with a max of
+/// ~0.02 so it never crossed the bar. This relative scheme works for
+/// every search mode without per-mode dispatch.
+///
+/// Falls back to FAINT when `max_score` isn't finite/positive (empty
+/// or all-zero result set).
+fn score_color(score: f64, max_score: f64) -> Color {
+    if !max_score.is_finite() || max_score <= 0.0 {
+        return FAINT;
+    }
+    let r = score / max_score;
+    if r >= 0.70 {
         HIGH
-    } else if score >= 0.4 {
+    } else if r >= 0.40 {
         MID
     } else {
         FAINT

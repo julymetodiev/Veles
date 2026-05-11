@@ -77,6 +77,66 @@ impl DenseIndex {
         out
     }
 
+    /// In-place compaction + extension for incremental update (§2.3).
+    ///
+    /// `keep_indices` must be sorted ascending and contain valid row
+    /// indices into the current matrix; rows are shifted to the front
+    /// in that order. The matrix is then truncated to `keep_indices.len()`
+    /// rows, the new embeddings are appended and L2-normalised in place.
+    ///
+    /// The previous flow allocated a `Vec<Vec<f32>>` of kept rows and
+    /// then re-allocated the flat matrix from scratch via `DenseIndex::new`
+    /// — two full-corpus copies per update. The compact path does one
+    /// pass of in-bounds row moves and a single resize. For a single-file
+    /// edit on a large corpus, most rows don't move (kept rows already
+    /// at their new positions), so the `memmove` cost is dominated by
+    /// the small "shift past the gap" work.
+    pub fn compact_and_extend(&mut self, keep_indices: &[usize], new_embeddings: Vec<Vec<f32>>) {
+        debug_assert!(
+            keep_indices.windows(2).all(|w| w[0] < w[1]),
+            "keep_indices must be sorted ascending and unique"
+        );
+        let dim = self.dim;
+        let kept = keep_indices.len();
+
+        // Shift kept rows to the front in order. Safe because
+        // keep_indices is ascending: for every iteration the source
+        // index (`old`) is ≥ the destination (`new`), and no later
+        // iteration reads from a destination we've already written
+        // (later iterations have new' > new and old' ≥ new' > new, so
+        // they read from `old'` which is past `new`).
+        for (new_pos, &old_pos) in keep_indices.iter().enumerate() {
+            if new_pos == old_pos {
+                continue;
+            }
+            let src_start = old_pos * dim;
+            let dst_start = new_pos * dim;
+            // copy_within handles non-overlapping or backward-overlap
+            // safely; old_pos > new_pos guarantees non-overlap in our
+            // direction.
+            self.matrix.copy_within(src_start..src_start + dim, dst_start);
+        }
+
+        // Truncate to kept rows; append new ones; normalise just the appended slice.
+        self.matrix.truncate(kept * dim);
+        let total_new = new_embeddings.len();
+        self.matrix.reserve(total_new * dim);
+        for emb in &new_embeddings {
+            let copy = emb.len().min(dim);
+            // Append row, padding with zeros if shorter than dim.
+            self.matrix.extend_from_slice(&emb[..copy]);
+            self.matrix.extend(std::iter::repeat(0.0).take(dim - copy));
+        }
+        self.n = kept + total_new;
+
+        // Kept rows were already L2-normalised; only the freshly
+        // appended rows need normalisation.
+        for i in kept..self.n {
+            let row = &mut self.matrix[i * dim..(i + 1) * dim];
+            normalise_in_place(row);
+        }
+    }
+
     /// Borrow row `i` as a slice.
     #[inline]
     fn row(&self, i: usize) -> &[f32] {
@@ -94,6 +154,7 @@ impl DenseIndex {
         k: usize,
         selector: Option<&[usize]>,
     ) -> (Vec<usize>, Vec<f32>) {
+        let _span = tracing::trace_span!("dense.query", n = self.n, k, dim = self.dim).entered();
         if self.n == 0 || k == 0 {
             return (Vec::new(), Vec::new());
         }
@@ -253,5 +314,51 @@ mod tests {
         let index = DenseIndex::new(embeddings);
         let (indices, _) = index.query(&[0.0, 1.0], 2, Some(&[1, 2]));
         assert_eq!(indices[0], 1);
+    }
+
+    #[test]
+    fn compact_and_extend_preserves_kept_rows() {
+        // Start with 4 rows; keep [0, 2] (drop 1 and 3); append 1 new row.
+        let mut index = DenseIndex::new(vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![0.7, 0.7],
+            vec![0.5, 0.5],
+        ]);
+        let kept_row0_before = index.row(0).to_vec();
+        let kept_row2_before = index.row(2).to_vec();
+
+        index.compact_and_extend(&[0, 2], vec![vec![1.0, 1.0]]);
+        assert_eq!(index.len(), 3);
+        // Row 0 unchanged (was already at index 0).
+        assert_eq!(index.row(0), kept_row0_before.as_slice());
+        // Former row 2 now at index 1.
+        assert_eq!(index.row(1), kept_row2_before.as_slice());
+        // Appended row should be L2-normalised: [1,1] → [1/√2, 1/√2].
+        let row2 = index.row(2);
+        let norm_sq: f32 = row2.iter().map(|x| x * x).sum();
+        assert!((norm_sq - 1.0).abs() < 1e-5, "appended row not normalised");
+    }
+
+    #[test]
+    fn compact_and_extend_full_drop() {
+        // Edge case: drop everything, then append.
+        let mut index = DenseIndex::new(vec![vec![1.0, 0.0], vec![0.0, 1.0]]);
+        index.compact_and_extend(&[], vec![vec![1.0, 0.0]]);
+        assert_eq!(index.len(), 1);
+    }
+
+    #[test]
+    fn compact_and_extend_no_new() {
+        // Compaction with no appended rows — just drop a row in the middle.
+        let mut index = DenseIndex::new(vec![
+            vec![1.0, 0.0],
+            vec![0.0, 1.0],
+            vec![0.7, 0.7],
+        ]);
+        let kept2 = index.row(2).to_vec();
+        index.compact_and_extend(&[0, 2], vec![]);
+        assert_eq!(index.len(), 2);
+        assert_eq!(index.row(1), kept2.as_slice());
     }
 }

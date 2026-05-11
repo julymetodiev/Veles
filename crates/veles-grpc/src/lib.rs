@@ -34,14 +34,11 @@
 //! [Veles]: https://github.com/julymetodiev/Veles
 //! [tonic]: https://github.com/hyperium/tonic
 
-use std::collections::HashMap;
-use std::path::Path;
 use std::sync::Arc;
 
-use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
-use veles_core::VelesIndex;
+use veles_core::cache::IndexCache;
 use veles_core::types::SearchMode;
 
 // Include the generated protobuf code.
@@ -52,83 +49,17 @@ pub mod proto {
 use proto::veles_service_server::{VelesService, VelesServiceServer};
 use proto::*;
 
-// ── Index Cache ───────────────────────────────────────────────────────────
-
-const DEFAULT_CACHE_SIZE: usize = 10;
-
-struct IndexCache {
-    indexes: HashMap<String, VelesIndex>,
-    max_size: usize,
-    model: model2vec_rs::model::StaticModel,
-}
-
-impl IndexCache {
-    fn new(model: model2vec_rs::model::StaticModel) -> Self {
-        Self {
-            indexes: HashMap::new(),
-            max_size: DEFAULT_CACHE_SIZE,
-            model,
-        }
-    }
-
-    /// Ensure the repo is cached (builds the index if not present).
-    fn ensure_cached(&mut self, repo: &str, include_text_files: bool) -> Result<(), String> {
-        if self.indexes.contains_key(repo) {
-            return Ok(());
-        }
-
-        // Evict first entry if at capacity.
-        if self.indexes.len() >= self.max_size
-            && let Some(key) = self.indexes.keys().next().cloned()
-        {
-            self.indexes.remove(&key);
-        }
-
-        let repo_owned = repo.to_string();
-        let model = self.model.clone();
-        let path = Path::new(&repo_owned);
-
-        // Mirror the MCP cache: prefer the persisted index when one exists
-        // so `stats` / `update` see the same chunks as `search`, and we
-        // don't re-embed on every cold start. Fall back to a fresh
-        // in-memory build if loading fails (incompatible format, missing
-        // sidecar files, etc.).
-        let index = if path.is_dir() {
-            if veles_core::persist::index_exists(path) {
-                match VelesIndex::load(path, model.clone()) {
-                    Ok(idx) => Ok(idx),
-                    Err(_) => VelesIndex::from_path(path, Some(model), None, include_text_files),
-                }
-            } else {
-                VelesIndex::from_path(path, Some(model), None, include_text_files)
-            }
-        } else if repo.starts_with("https://") || repo.starts_with("http://") {
-            VelesIndex::from_git(repo, None, Some(model), include_text_files)
-        } else {
-            return Err("Invalid repo: must be a local directory or https:// URL".to_string());
-        }
-        .map_err(|e| format!("Failed to index {repo}: {e}"))?;
-
-        self.indexes.insert(repo.to_string(), index);
-        Ok(())
-    }
-
-    fn get(&self, repo: &str) -> Option<&VelesIndex> {
-        self.indexes.get(repo)
-    }
-}
-
 // ── gRPC Service Implementation ───────────────────────────────────────────
 
 #[derive(Clone)]
 pub struct VelesServiceImpl {
-    cache: Arc<Mutex<IndexCache>>,
+    cache: Arc<IndexCache>,
 }
 
 impl VelesServiceImpl {
     pub fn new(model: model2vec_rs::model::StaticModel) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(IndexCache::new(model))),
+            cache: Arc::new(IndexCache::new(model)),
         }
     }
 
@@ -171,12 +102,13 @@ impl VelesService for VelesServiceImpl {
         request: Request<IndexRequest>,
     ) -> Result<Response<IndexResponse>, Status> {
         let req = request.into_inner();
-        let mut cache = self.cache.lock().await;
-        cache
-            .ensure_cached(&req.repo, req.include_text_files)
-            .map_err(Status::internal)?;
-
-        let stats = cache.get(&req.repo).unwrap().stats();
+        let arc = self
+            .cache
+            .get_or_load(&req.repo, req.include_text_files)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let index = arc.read().await;
+        let stats = index.stats();
         Ok(Response::new(IndexResponse {
             stats: convert_stats(stats),
         }))
@@ -190,12 +122,13 @@ impl VelesService for VelesServiceImpl {
         let top_k = if req.top_k > 0 { req.top_k as usize } else { 5 };
         let mode = req.mode.parse::<SearchMode>().unwrap_or(SearchMode::Hybrid);
 
-        let mut cache = self.cache.lock().await;
-        cache
-            .ensure_cached(&req.repo, req.include_text_files)
-            .map_err(Status::internal)?;
+        let arc = self
+            .cache
+            .get_or_load(&req.repo, req.include_text_files)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let index = arc.read().await;
 
-        let index = cache.get(&req.repo).unwrap();
         let results = index.search(
             &req.query,
             top_k,
@@ -225,12 +158,13 @@ impl VelesService for VelesServiceImpl {
         let req = request.into_inner();
         let top_k = if req.top_k > 0 { req.top_k as usize } else { 5 };
 
-        let mut cache = self.cache.lock().await;
-        cache
-            .ensure_cached(&req.repo, req.include_text_files)
-            .map_err(Status::internal)?;
+        let arc = self
+            .cache
+            .get_or_load(&req.repo, req.include_text_files)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let index = arc.read().await;
 
-        let index = cache.get(&req.repo).unwrap();
         let chunk = index
             .resolve_chunk(&req.file_path, req.line as usize)
             .ok_or_else(|| {
@@ -250,10 +184,13 @@ impl VelesService for VelesServiceImpl {
         request: Request<GetStatsRequest>,
     ) -> Result<Response<GetStatsResponse>, Status> {
         let req = request.into_inner();
-        let cache = self.cache.lock().await;
-        let index = cache
-            .get(&req.repo)
+        // Peek-only: preserves the previous "Repo not indexed" semantic
+        // for clients that explicitly bootstrap via `Index` first.
+        let arc = self
+            .cache
+            .peek(&req.repo)
             .ok_or_else(|| Status::not_found(format!("Repo not indexed: {}", req.repo)))?;
+        let index = arc.read().await;
 
         let stats = index.stats();
         Ok(Response::new(GetStatsResponse {

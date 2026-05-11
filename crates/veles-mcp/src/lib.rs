@@ -66,17 +66,14 @@
 //! [Veles]: https://github.com/julymetodiev/Veles
 //! [MCP 2024-11-05]: https://modelcontextprotocol.io/specification/2024-11-05
 
-use std::collections::HashMap;
-use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::sync::Mutex;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use veles_core::VelesIndex;
 use veles_core::filter;
 use veles_core::symbols::Symbol;
 use veles_core::types::SearchMode;
@@ -448,86 +445,17 @@ fn tools() -> Vec<Tool> {
     ]
 }
 
-// ── Index Cache ───────────────────────────────────────────────────────────
-
-const CACHE_MAX_SIZE: usize = 10;
-
-struct IndexCache {
-    entries: HashMap<String, VelesIndex>,
-    model: model2vec_rs::model::StaticModel,
-}
-
-impl IndexCache {
-    fn new(model: model2vec_rs::model::StaticModel) -> Self {
-        Self {
-            entries: HashMap::new(),
-            model,
-        }
-    }
-
-    fn get_or_index(&mut self, repo: &str, include_text_files: bool) -> Result<&VelesIndex> {
-        if self.entries.contains_key(repo) {
-            return Ok(self.entries.get(repo).unwrap());
-        }
-
-        // Evict LRU if at capacity.
-        if self.entries.len() >= CACHE_MAX_SIZE {
-            // Simple eviction: remove the first entry.
-            if let Some(key) = self.entries.keys().next().cloned() {
-                self.entries.remove(&key);
-            }
-        }
-
-        let model = self.model.clone();
-        let path = Path::new(repo);
-        let index = if path.is_dir() {
-            // Prefer the persisted index when one exists: keeps `stats`,
-            // `status`, and `update` consistent (they all see the same
-            // chunk count / manifest), and avoids re-embedding on every
-            // process start. Fall back to a fresh in-memory build if the
-            // load fails (incompatible format, missing files, ...).
-            if veles_core::persist::index_exists(path) {
-                match VelesIndex::load(path, model.clone()) {
-                    Ok(idx) => idx,
-                    Err(_) => VelesIndex::from_path(path, Some(model), None, include_text_files)?,
-                }
-            } else {
-                VelesIndex::from_path(path, Some(model), None, include_text_files)?
-            }
-        } else if repo.starts_with("https://") || repo.starts_with("http://") {
-            VelesIndex::from_git(repo, None, Some(model), include_text_files)?
-        } else {
-            bail!("Invalid repo: must be a local directory or https:// URL");
-        };
-
-        self.entries.insert(repo.to_string(), index);
-        Ok(self.entries.get(repo).unwrap())
-    }
-
-    /// Like [`Self::get_or_index`] but returns an exclusive borrow so the
-    /// caller can mutate the index (e.g. via `update_from_path`).
-    fn get_or_index_mut(
-        &mut self,
-        repo: &str,
-        include_text_files: bool,
-    ) -> Result<&mut VelesIndex> {
-        // Reuse the immutable path to populate the cache, then re-borrow mut.
-        let _ = self.get_or_index(repo, include_text_files)?;
-        Ok(self.entries.get_mut(repo).unwrap())
-    }
-}
-
 // ── MCP Server ───────────────────────────────────────────────────────────
 
 pub struct McpServer {
-    cache: Arc<Mutex<IndexCache>>,
+    cache: Arc<veles_core::cache::IndexCache>,
     server_info: Value,
 }
 
 impl McpServer {
     pub fn new(model: model2vec_rs::model::StaticModel) -> Self {
         Self {
-            cache: Arc::new(Mutex::new(IndexCache::new(model))),
+            cache: Arc::new(veles_core::cache::IndexCache::new(model)),
             server_info: json!({
                 "name": "veles",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -536,15 +464,18 @@ impl McpServer {
     }
 
     /// Run the MCP server, reading JSON-RPC from stdin and writing to stdout.
+    ///
+    /// Uses tokio's async stdin/stdout so the runtime stays responsive
+    /// while we await the parse / dispatch of each request (§4.3 of the
+    /// perf plan). The previous sync `BufRead.lines()` loop pinned a
+    /// worker thread on `read(2)`; with async I/O the worker is free to
+    /// run other tasks while we wait for input.
     pub async fn run(&self) -> Result<()> {
-        let stdin = io::stdin();
-        let mut stdout = io::stdout();
+        let stdin = tokio::io::stdin();
+        let mut reader = BufReader::new(stdin).lines();
+        let mut stdout = tokio::io::stdout();
 
-        // Send an initialization notification to signal readiness.
-        // MCP servers are expected to just respond to requests.
-
-        for line in stdin.lock().lines() {
-            let line = line?;
+        while let Some(line) = reader.next_line().await? {
             if line.trim().is_empty() {
                 continue;
             }
@@ -561,16 +492,19 @@ impl McpServer {
                             message: format!("Parse error: {e}"),
                         }),
                     };
-                    writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
-                    stdout.flush()?;
+                    let line = serde_json::to_string(&resp)?;
+                    stdout.write_all(line.as_bytes()).await?;
+                    stdout.write_all(b"\n").await?;
+                    stdout.flush().await?;
                     continue;
                 }
             };
 
             let response = self.handle_request(request).await;
             let response_str = serde_json::to_string(&response)?;
-            writeln!(stdout, "{response_str}")?;
-            stdout.flush()?;
+            stdout.write_all(response_str.as_bytes()).await?;
+            stdout.write_all(b"\n").await?;
+            stdout.flush().await?;
         }
 
         Ok(())
@@ -682,14 +616,18 @@ impl McpServer {
         let min_score = args["min_score"].as_f64();
         let format = args["format"].as_str().unwrap_or("default");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let glob_paths =
-            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+            filter::resolve_path_filter(&index, &path_globs, &exclude_globs).map_err(|e| {
                 JsonRpcError {
                     code: -32000,
                     message: e.to_string(),
@@ -733,11 +671,15 @@ impl McpServer {
         let lang = string_array(&args, "lang");
         let kind_filter = args["kind"].as_str().map(|s| s.to_ascii_lowercase());
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let mut hits: Vec<&Symbol> = index
             .symbols()
@@ -776,11 +718,15 @@ impl McpServer {
         })?;
         let repo = args["repo"].as_str().unwrap_or(".");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let mut hits = index.symbols_for_file(file_path);
         hits.sort_by_key(|s| s.start_line);
@@ -808,11 +754,15 @@ impl McpServer {
         let top_k = args["top_k"].as_u64().unwrap_or(10) as usize;
         let format = args["format"].as_str().unwrap_or("default");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let mut defs: Vec<&Symbol> = index.symbols().iter().filter(|s| s.name == name).collect();
         defs.sort_by(|a, b| {
@@ -927,11 +877,15 @@ impl McpServer {
     async fn handle_stats(&self, args: Value) -> Result<Value, JsonRpcError> {
         let repo = args["repo"].as_str().unwrap_or(".");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let stats = index.stats();
         let manifest = index.manifest();
@@ -980,13 +934,15 @@ impl McpServer {
         }
         let path_buf = path.to_path_buf();
 
-        let mut cache = self.cache.lock().await;
-        let index = cache
-            .get_or_index_mut(repo, false)
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
             .map_err(|e| JsonRpcError {
                 code: -32000,
                 message: e.to_string(),
             })?;
+        let mut index = index_arc.write().await;
 
         let started = std::time::Instant::now();
         let report = index
@@ -1042,17 +998,21 @@ impl McpServer {
         let exclude_globs = string_array(&args, "exclude");
         let limit = args["limit"].as_u64().unwrap_or(200) as usize;
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         // Resolve globs against the index's known file set. None means
         // no glob filter; Some(empty) is impossible since `resolve_path_filter`
         // errors when nothing matches.
         let glob_paths =
-            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+            filter::resolve_path_filter(&index, &path_globs, &exclude_globs).map_err(|e| {
                 JsonRpcError {
                     code: -32000,
                     message: e.to_string(),
@@ -1114,14 +1074,18 @@ impl McpServer {
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let glob_paths =
-            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+            filter::resolve_path_filter(&index, &path_globs, &exclude_globs).map_err(|e| {
                 JsonRpcError {
                     code: -32000,
                     message: e.to_string(),
@@ -1185,11 +1149,15 @@ impl McpServer {
         })? as usize;
         let repo = args["repo"].as_str().unwrap_or(".");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         // Innermost = symbol with the smallest range that still contains `line`.
         // Ties broken by the later start_line (more specific). Both `start_line`
@@ -1358,50 +1326,15 @@ impl McpServer {
         })?;
 
         let exts = veles_core::walker::filter_extensions(None, manifest.include_text_files);
-        let on_disk: std::collections::HashMap<String, (std::path::PathBuf, u64, i64)> =
-            veles_core::walker::walk_files(repo_path, &exts)
-                .filter_map(|abs| {
-                    let rel = abs
-                        .strip_prefix(repo_path)
-                        .ok()?
-                        .to_string_lossy()
-                        .into_owned();
-                    let meta = std::fs::metadata(&abs).ok()?;
-                    let mtime = meta
-                        .modified()
-                        .ok()?
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .ok()
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(0);
-                    Some((rel, (abs, meta.len(), mtime)))
-                })
-                .collect();
+        // Shared classification (§3.3) — same code path as
+        // VelesIndex::update_from_path, so `status` and `update` are
+        // guaranteed to agree on counts.
+        let state = veles_core::persist::classify_disk(repo_path, &manifest, &exts);
 
-        // Mirror `VelesIndex::update_from_path` classification so a stale
-        // mtime alone (touch / git checkout of identical bytes) doesn't
-        // produce a false-positive "modified" count.
-        let mut added = 0usize;
-        let mut modified = 0usize;
-        let mut mtime_only = 0usize;
-        for (rel, (abs, size, mtime)) in &on_disk {
-            match manifest.files.get(rel) {
-                Some(prev) if prev.size == *size && prev.mtime_secs == *mtime => {}
-                Some(prev) if prev.size == *size && prev.content_hash.is_some() => {
-                    match veles_core::persist::content_hash(abs) {
-                        Ok(h) if Some(&h) == prev.content_hash.as_ref() => mtime_only += 1,
-                        Ok(_) | Err(_) => modified += 1,
-                    }
-                }
-                Some(_) => modified += 1,
-                None => added += 1,
-            }
-        }
-        let removed = manifest
-            .files
-            .keys()
-            .filter(|k| !on_disk.contains_key(*k))
-            .count();
+        let added = state.count_added();
+        let modified = state.count_modified();
+        let mtime_only = state.count_mtime_only();
+        let removed = state.count_removed();
 
         let mut lines: Vec<String> = vec![
             format!("Index at {}/.veles", repo_path.display()),
@@ -1414,7 +1347,7 @@ impl McpServer {
             format!("  total chunks     : {}", manifest.total_chunks),
             String::new(),
             "On-disk diff:".to_string(),
-            format!("  files seen now   : {}", on_disk.len()),
+            format!("  files seen now   : {}", state.seen_now()),
             format!("  added            : {added}"),
             format!("  modified         : {modified}"),
             format!("  removed          : {removed}"),
@@ -1457,11 +1390,15 @@ impl McpServer {
         let path_globs = string_array(&args, "path");
         let exclude_globs = string_array(&args, "exclude");
 
-        let mut cache = self.cache.lock().await;
-        let index = cache.get_or_index(repo, false).map_err(|e| JsonRpcError {
-            code: -32000,
-            message: e.to_string(),
-        })?;
+        let index_arc = self
+            .cache
+            .get_or_load(repo, false)
+            .await
+            .map_err(|e| JsonRpcError {
+                code: -32000,
+                message: e.to_string(),
+            })?;
+        let index = index_arc.read().await;
 
         let chunk = index
             .resolve_chunk(file_path, line)
@@ -1472,7 +1409,7 @@ impl McpServer {
             .clone();
 
         let glob_paths =
-            filter::resolve_path_filter(index, &path_globs, &exclude_globs).map_err(|e| {
+            filter::resolve_path_filter(&index, &path_globs, &exclude_globs).map_err(|e| {
                 JsonRpcError {
                     code: -32000,
                     message: e.to_string(),

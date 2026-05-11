@@ -23,6 +23,7 @@ blake3 = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
 ahash = { version = "0.8", features = ["serde"] }
+dashmap = { workspace = true }
 bincode = { workspace = true }
 
 # Tree-sitter for symbol extraction
@@ -35,3 +36,16 @@ tree-sitter-go = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "build"
+harness = false
+
+[[bench]]
+name = "update"
+harness = false

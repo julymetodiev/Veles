@@ -96,6 +96,7 @@
 //! [Veles]: https://github.com/julymetodiev/Veles
 //! [model2vec]: https://github.com/MinishLab/model2vec-rs
 
+pub mod cache;
 pub mod chunker;
 pub mod filter;
 pub mod index;

@@ -87,6 +87,47 @@ pub fn top_k_indexed(scores: &[f64], k: usize) -> Vec<(usize, f64)> {
     out
 }
 
+/// Select the top-k highest-scoring `(usize, f64)` pairs from an iterator.
+///
+/// Used by the BM25 index for sparse top-k: we stream the non-zero
+/// scored docs directly out of the accumulator without ever materialising
+/// a dense `Vec<f64>` of length `num_docs`. Excludes entries with score
+/// `<= 0.0`.
+pub fn top_k_from_iter_f64<I>(iter: I, k: usize) -> Vec<(usize, f64)>
+where
+    I: IntoIterator<Item = (usize, f64)>,
+{
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut heap: BinaryHeap<MinEntry> = BinaryHeap::with_capacity(k + 1);
+    for (i, s) in iter {
+        if s <= 0.0 {
+            continue;
+        }
+        if heap.len() < k {
+            heap.push(MinEntry {
+                idx: i as u32,
+                score: s,
+            });
+        } else if let Some(top) = heap.peek()
+            && s > top.score
+        {
+            heap.pop();
+            heap.push(MinEntry {
+                idx: i as u32,
+                score: s,
+            });
+        }
+    }
+    let mut out: Vec<(usize, f64)> = heap
+        .into_iter()
+        .map(|e| (e.idx as usize, e.score))
+        .collect();
+    out.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    out
+}
+
 /// Select the top-k highest-scoring `(usize, f32)` pairs from an iterator.
 ///
 /// Used by the dense index where scores are f32.

@@ -14,7 +14,7 @@
 //! `update` can detect added / removed / modified files without re-reading
 //! everything.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,6 +26,7 @@ use crate::index::dense::DenseIndex;
 use crate::index::sparse::Bm25Index;
 use crate::symbols::Symbol;
 use crate::types::Chunk;
+use crate::walker;
 
 /// Directory name used under the indexed repo to store the on-disk index.
 pub const INDEX_DIR_NAME: &str = ".veles";
@@ -168,6 +169,17 @@ pub struct PersistedIndex {
 }
 
 /// Write all index artefacts to `<repo_root>/.veles/`.
+///
+/// Manifest goes first synchronously so a partial-failure left-over
+/// has the freshest pointer to "what was meant to be saved". The four
+/// bincode artefacts are then written in parallel via `rayon::join`
+/// nested 2×2 (§5.7 of the perf plan) — modern filesystems handle
+/// concurrent same-dir creates fine, and the per-file `BufWriter` +
+/// bincode encode work in CPU dominate I/O for large indexes.
+///
+/// Also drops the previous `chunks.to_vec()` / `symbols.to_vec()`
+/// temporaries: slices implement `Serialize`, so we feed them in
+/// directly and skip the per-save full copy.
 pub fn save(
     repo_root: &Path,
     manifest: &Manifest,
@@ -180,10 +192,30 @@ pub fn save(
     fs::create_dir_all(&dir).with_context(|| format!("create index dir {}", dir.display()))?;
 
     write_json(&dir.join(MANIFEST_FILE), manifest)?;
-    write_bincode(&dir.join(CHUNKS_FILE), &chunks.to_vec())?;
-    write_bincode(&dir.join(BM25_FILE), bm25)?;
-    write_bincode(&dir.join(DENSE_FILE), dense)?;
-    write_bincode(&dir.join(SYMBOLS_FILE), &symbols.to_vec())?;
+
+    let chunks_path = dir.join(CHUNKS_FILE);
+    let bm25_path = dir.join(BM25_FILE);
+    let dense_path = dir.join(DENSE_FILE);
+    let symbols_path = dir.join(SYMBOLS_FILE);
+
+    let ((r1, r2), (r3, r4)) = rayon::join(
+        || {
+            rayon::join(
+                || write_bincode(&chunks_path, &chunks),
+                || write_bincode(&bm25_path, bm25),
+            )
+        },
+        || {
+            rayon::join(
+                || write_bincode(&dense_path, dense),
+                || write_bincode(&symbols_path, &symbols),
+            )
+        },
+    );
+    r1?;
+    r2?;
+    r3?;
+    r4?;
     Ok(())
 }
 
@@ -263,6 +295,165 @@ fn read_bincode<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     let value =
         bincode::deserialize_from(r).with_context(|| format!("decode {}", path.display()))?;
     Ok(value)
+}
+
+/// Per-file disk metadata used during classification.
+#[derive(Debug, Clone)]
+pub struct DiskEntry {
+    pub abs_path: PathBuf,
+    pub size: u64,
+    pub mtime_secs: i64,
+}
+
+/// Per-file change classification against a `Manifest`.
+///
+/// Distinguishes the four cases that incremental `update` cares about:
+/// no content read (`Unchanged`), mtime drift but bytes still match
+/// (`MtimeOnly`), bytes actually changed (`Modified`), or new since
+/// last save (`Added`). Files removed since last save live in
+/// `DiskState::removed`, not here.
+#[derive(Debug, Clone)]
+pub enum Classification {
+    /// `(size, mtime)` matched the manifest exactly — no content read.
+    Unchanged,
+    /// `mtime` drifted but the BLAKE3 content hash still matches.
+    /// Carries the hash we computed so callers don't re-read the file.
+    MtimeOnly { hash: String },
+    /// File was in the manifest but bytes have actually changed.
+    /// `hash` is `Some` when we computed one during classification
+    /// (only happens when size matched and the manifest had a hash),
+    /// otherwise `None`.
+    Modified { hash: Option<String> },
+    /// File is new — not in the manifest.
+    Added,
+}
+
+/// Result of walking the repo and classifying each file against a manifest.
+#[derive(Debug)]
+pub struct DiskState {
+    /// For each file currently on disk: its metadata.
+    pub on_disk: HashMap<String, DiskEntry>,
+    /// Per-file classification — keys mirror `on_disk`.
+    pub classification: HashMap<String, Classification>,
+    /// Paths that were in the manifest but are not on disk now.
+    pub removed: Vec<String>,
+}
+
+impl DiskState {
+    /// Files seen now (on disk).
+    pub fn seen_now(&self) -> usize {
+        self.on_disk.len()
+    }
+    /// Count of files in each classification bucket.
+    pub fn count_added(&self) -> usize {
+        self.classification
+            .values()
+            .filter(|c| matches!(c, Classification::Added))
+            .count()
+    }
+    pub fn count_modified(&self) -> usize {
+        self.classification
+            .values()
+            .filter(|c| matches!(c, Classification::Modified { .. }))
+            .count()
+    }
+    pub fn count_mtime_only(&self) -> usize {
+        self.classification
+            .values()
+            .filter(|c| matches!(c, Classification::MtimeOnly { .. }))
+            .count()
+    }
+    pub fn count_unchanged(&self) -> usize {
+        self.classification
+            .values()
+            .filter(|c| matches!(c, Classification::Unchanged))
+            .count()
+    }
+    pub fn count_removed(&self) -> usize {
+        self.removed.len()
+    }
+    /// True iff nothing changed at all (no chunk edits, no mtime
+    /// drift, no adds/removes). Matches `UpdateReport::is_noop` after
+    /// `update_from_path` has consumed the state.
+    pub fn is_clean(&self) -> bool {
+        self.removed.is_empty()
+            && self
+                .classification
+                .values()
+                .all(|c| matches!(c, Classification::Unchanged))
+    }
+}
+
+/// Walk `repo_root` filtered by `extensions` and classify each file
+/// against `manifest`. Single place where the "mtime fast path then
+/// BLAKE3 fallback" decision lives — both `VelesIndex::update_from_path`
+/// and the MCP `status` handler call this (§3.3 of the perf plan).
+pub fn classify_disk(
+    repo_root: &Path,
+    manifest: &Manifest,
+    extensions: &HashSet<String>,
+) -> DiskState {
+    // 1. Walk on-disk files.
+    let mut on_disk: HashMap<String, DiskEntry> = HashMap::new();
+    for abs in walker::walk_files(repo_root, extensions) {
+        let Ok(rel_path) = abs.strip_prefix(repo_root) else {
+            continue;
+        };
+        let rel = rel_path.to_string_lossy().into_owned();
+        let Ok(meta) = fs::metadata(&abs) else {
+            continue;
+        };
+        let mtime_secs = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        on_disk.insert(
+            rel,
+            DiskEntry {
+                abs_path: abs,
+                size: meta.len(),
+                mtime_secs,
+            },
+        );
+    }
+
+    // 2. Classify each on-disk file.
+    let mut classification: HashMap<String, Classification> = HashMap::new();
+    for (rel, entry) in &on_disk {
+        let cls = match manifest.files.get(rel) {
+            Some(prev) if prev.size == entry.size && prev.mtime_secs == entry.mtime_secs => {
+                Classification::Unchanged
+            }
+            Some(prev) if prev.size == entry.size && prev.content_hash.is_some() => {
+                match content_hash(&entry.abs_path) {
+                    Ok(h) if Some(&h) == prev.content_hash.as_ref() => {
+                        Classification::MtimeOnly { hash: h }
+                    }
+                    Ok(h) => Classification::Modified { hash: Some(h) },
+                    Err(_) => Classification::Modified { hash: None },
+                }
+            }
+            Some(_) => Classification::Modified { hash: None },
+            None => Classification::Added,
+        };
+        classification.insert(rel.clone(), cls);
+    }
+
+    // 3. Files in the manifest that disappeared.
+    let removed: Vec<String> = manifest
+        .files
+        .keys()
+        .filter(|k| !on_disk.contains_key(*k))
+        .cloned()
+        .collect();
+
+    DiskState {
+        on_disk,
+        classification,
+        removed,
+    }
 }
 
 /// Outcome of an incremental update — returned by
