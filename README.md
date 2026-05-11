@@ -191,15 +191,20 @@ Exposed tools:
 |----------------|---------------------------------------------------------------------------------------|
 | `search`       | Hybrid / BM25 / semantic query, with optional `lang` / `path` / `exclude` / `min_score`. |
 | `defs`         | Tree-sitter definitions for an exact symbol name (Rust, Python, JS, TS, Go).          |
-| `symbols`      | Outline of a single file — every definition it contains.                              |
 | `refs`         | Definitions plus BM25 hits — "where is X defined and where is X used", in one call.   |
-| `stats`        | File / chunk counts, model metadata, per-language chunk breakdown.                    |
-| `update`       | Incremental refresh of a local repo's `.veles/` index after edits.                    |
 | `find_related` | Semantically similar chunks for a `(file_path, line)` from an earlier `search`.       |
+| `list_symbols` | Every tree-sitter definition across the index, with `kind` / `lang` / `path` filters. |
+| `symbols`      | Outline of a single file — every definition it contains.                              |
+| `scope_at`     | Innermost tree-sitter symbol containing a given `file:line`.                          |
+| `files`        | Distinct file paths in the index, with `lang` / `path` / `exclude` filters.           |
+| `read`         | Line range from an indexed file (capped at 500 lines, repo-relative paths only).      |
+| `stats`        | File / chunk counts, model metadata, per-language chunk breakdown.                    |
+| `status`       | Non-mutating drift check vs. persisted manifest; distinguishes content edits from bare `touch`. |
+| `update`       | Incremental refresh of a local repo's `.veles/` index after edits (BLAKE3-aware).     |
 
 `search`, `find_related`, and `refs` accept a `format` argument:
 - `default` (default) — scored, fenced code blocks tagged with the enclosing scope.
-- `paths` — flat `path:start-end` per line, no header / score / body.
+- `paths` — flat per-line list. `search` / `find_related` emit `path:start-end`; `refs` emits `path:line` per word-boundary occurrence of the symbol.
 - `unique_paths` — collapsed to one `path` line per file. For agent shortlist workflows that just want "which files matter".
 
 ## Build from source

@@ -74,10 +74,13 @@ let model = veles_core::model::load_model(None)?;
 let mut reloaded = VelesIndex::load(repo, model)?;
 
 // Files whose (size, mtime) fingerprint hasn't changed keep their
-// embeddings; only modified/added files are re-embedded.
+// embeddings. When mtime drifts but the BLAKE3 content hash still
+// matches, we do a manifest-only refresh (no re-embed). Only files
+// with genuinely different bytes are re-embedded.
 let report = reloaded.update_from_path(repo)?;
-eprintln!("{} added, {} modified, {} removed",
-    report.added_files, report.modified_files, report.removed_files);
+eprintln!("{} added, {} modified, {} removed, {} mtime-only",
+    report.added_files, report.modified_files,
+    report.removed_files, report.mtime_refreshed_files);
 # Ok(())
 # }
 ```

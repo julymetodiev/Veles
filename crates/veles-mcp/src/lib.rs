@@ -17,15 +17,28 @@
 //! - `symbols` — the tree-sitter outline of a single file. A cheap
 //!   alternative to reading the whole file when only the structure
 //!   matters.
+//! - `list_symbols` — every tree-sitter definition in the index with
+//!   optional kind / language / path-glob filters. Exploration tool
+//!   for "every struct in crates/foo/" kind of questions.
 //! - `refs` — definitions plus BM25 hits for a symbol name. One call
 //!   to answer both "where is X defined" and "where is X used".
-//! - `stats` — file count, chunk count, model metadata, and per-language
-//!   chunk breakdown for the indexed repo.
-//! - `update` — incrementally refresh the index against the current
-//!   state of disk (re-embed only fingerprint-changed files) and
-//!   persist to `<repo>/.veles/`. Local repos only.
 //! - `find_related` — semantically similar chunks for a `(file, line)`
 //!   pair returned by an earlier `search`.
+//! - `scope_at` — innermost tree-sitter symbol containing a given
+//!   `file:line`. Cheaper than scanning the file's full symbol list.
+//! - `files` — distinct file paths in the index with optional
+//!   language / path / exclude filters. Orientation tool.
+//! - `read` — read a line range from an indexed file (capped at 500
+//!   lines, refuses absolute / `..`-escaping paths).
+//! - `stats` — file count, chunk count, model metadata, and per-language
+//!   chunk breakdown for the indexed repo.
+//! - `status` — non-mutating drift check: compare the persisted
+//!   manifest against current disk state. Useful before deciding
+//!   whether to call `update`.
+//! - `update` — incrementally refresh the index against the current
+//!   state of disk (re-embed only files whose BLAKE3 content hash
+//!   changed; mtime drift on unchanged bytes is a manifest-only
+//!   refresh) and persist to `<repo>/.veles/`. Local repos only.
 //!
 //! The supported transport is line-delimited JSON-RPC on stdin/stdout
 //! per the [MCP 2024-11-05] revision, with `tools/list` and
@@ -248,7 +261,7 @@ fn tools() -> Vec<Tool> {
         },
         Tool {
             name: "update".into(),
-            description: "Refresh the index for `repo` against the current state of disk: re-embed only files whose (size, mtime) fingerprint changed, drop removed files, pick up new ones, and persist the result under `<repo>/.veles/`. Cheap after small edits. Not supported for https:// git URLs (re-run `search` to re-clone instead).".into(),
+            description: "Refresh the index for `repo` against the current state of disk: re-embed only files whose content actually changed, drop removed files, pick up new ones, and persist under `<repo>/.veles/`. Files whose mtime drifted but content (BLAKE3) still matches do a manifest-only refresh — no re-embed. Cheap after small edits. Not supported for https:// git URLs (re-run `search` to re-clone instead).".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -835,13 +848,29 @@ impl McpServer {
         }
 
         let text = if format == "paths" {
-            // Flat list: defs as `path:line`, BM25 hits as `path:start-end`.
+            // Flat list, line-precise: defs at their start line, BM25 hits
+            // expanded to one `path:line` per word-boundary occurrence of
+            // the symbol inside the chunk. Falls back to the chunk range
+            // if no word-boundary match lands inside (BM25 sometimes picks
+            // chunks via path tokens or partial-stem hits).
+            let needle = regex::Regex::new(&format!(r"\b{}\b", regex::escape(name))).ok();
             let mut lines: Vec<String> = Vec::with_capacity(defs.len() + bm25_hits.len());
             for s in &defs {
                 lines.push(format!("{}:{}", s.file_path, s.start_line));
             }
             for r in &bm25_hits {
-                lines.push(r.chunk.location());
+                let mut emitted = 0usize;
+                if let Some(ref re) = needle {
+                    for (i, line) in r.chunk.content.lines().enumerate() {
+                        if re.is_match(line) {
+                            lines.push(format!("{}:{}", r.chunk.file_path, r.chunk.start_line + i));
+                            emitted += 1;
+                        }
+                    }
+                }
+                if emitted == 0 {
+                    lines.push(r.chunk.location());
+                }
             }
             lines.join("\n")
         } else if format == "unique_paths" {

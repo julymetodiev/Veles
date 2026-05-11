@@ -63,10 +63,12 @@
 //! let mut reloaded = VelesIndex::load(repo, model)?;
 //!
 //! // Refresh files that changed on disk; unchanged files keep their
-//! // embeddings.
+//! // embeddings. Bare `touch` (mtime drift, identical bytes) is a
+//! // manifest-only refresh via the BLAKE3 content_hash fallback.
 //! let report = reloaded.update_from_path(repo)?;
-//! eprintln!("{} added, {} modified, {} removed",
-//!     report.added_files, report.modified_files, report.removed_files);
+//! eprintln!("{} added, {} modified, {} removed, {} mtime-only",
+//!     report.added_files, report.modified_files,
+//!     report.removed_files, report.mtime_refreshed_files);
 //! # Ok(())
 //! # }
 //! ```

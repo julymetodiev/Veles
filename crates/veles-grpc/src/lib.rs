@@ -88,8 +88,20 @@ impl IndexCache {
         let model = self.model.clone();
         let path = Path::new(&repo_owned);
 
+        // Mirror the MCP cache: prefer the persisted index when one exists
+        // so `stats` / `update` see the same chunks as `search`, and we
+        // don't re-embed on every cold start. Fall back to a fresh
+        // in-memory build if loading fails (incompatible format, missing
+        // sidecar files, etc.).
         let index = if path.is_dir() {
-            VelesIndex::from_path(path, Some(model), None, include_text_files)
+            if veles_core::persist::index_exists(path) {
+                match VelesIndex::load(path, model.clone()) {
+                    Ok(idx) => Ok(idx),
+                    Err(_) => VelesIndex::from_path(path, Some(model), None, include_text_files),
+                }
+            } else {
+                VelesIndex::from_path(path, Some(model), None, include_text_files)
+            }
         } else if repo.starts_with("https://") || repo.starts_with("http://") {
             VelesIndex::from_git(repo, None, Some(model), include_text_files)
         } else {

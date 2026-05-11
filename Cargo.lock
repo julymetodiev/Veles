@@ -2833,6 +2833,7 @@ version = "0.4.4"
 dependencies = [
  "anyhow",
  "model2vec-rs",
+ "regex",
  "serde",
  "serde_json",
  "tokio",
