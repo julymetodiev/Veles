@@ -130,6 +130,12 @@ impl Bm25Index {
     /// Returns a vector of scores, one per document. If `selector` is provided,
     /// only documents at those indices are scored (others get 0.0).
     pub fn get_scores(&self, query_tokens: &[String], selector: Option<&[usize]>) -> Vec<f64> {
+        let _span = tracing::trace_span!(
+            "bm25.get_scores",
+            n_docs = self.num_docs,
+            n_tokens = query_tokens.len()
+        )
+        .entered();
         let mut scores = vec![0.0f64; self.num_docs];
         if self.num_docs == 0 || query_tokens.is_empty() {
             return scores;

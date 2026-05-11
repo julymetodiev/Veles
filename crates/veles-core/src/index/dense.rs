@@ -94,6 +94,7 @@ impl DenseIndex {
         k: usize,
         selector: Option<&[usize]>,
     ) -> (Vec<usize>, Vec<f32>) {
+        let _span = tracing::trace_span!("dense.query", n = self.n, k, dim = self.dim).entered();
         if self.n == 0 || k == 0 {
             return (Vec::new(), Vec::new());
         }

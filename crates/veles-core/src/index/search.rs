@@ -58,14 +58,21 @@ pub fn search_semantic(
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    let _span = tracing::trace_span!("search.semantic", top_k, n_chunks = chunks.len()).entered();
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
-    let query_embedding = model.encode(&[query.to_string()]);
+    let query_embedding = {
+        let _s = tracing::trace_span!("search.encode_query").entered();
+        model.encode(&[query.to_string()])
+    };
     let query_vec = &query_embedding[0];
 
     let candidate_count = top_k.saturating_mul(PURE_MODE_CANDIDATE_OVERSHOOT);
-    let (indices, similarities) = dense_index.query(query_vec, candidate_count, selector);
+    let (indices, similarities) = {
+        let _s = tracing::trace_span!("search.dense_query", candidate_count).entered();
+        dense_index.query(query_vec, candidate_count, selector)
+    };
 
     let mut scores = vec![0.0f64; chunks.len()];
     for (idx, sim) in indices.iter().zip(similarities.iter()) {
@@ -94,6 +101,7 @@ pub fn search_bm25(
     top_k: usize,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    let _span = tracing::trace_span!("search.bm25", top_k, n_chunks = chunks.len()).entered();
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
@@ -105,7 +113,10 @@ pub fn search_bm25(
     }
 
     let candidate_count = top_k.saturating_mul(PURE_MODE_CANDIDATE_OVERSHOOT);
-    let raw = bm25_index.top_k(&tokens, candidate_count, selector);
+    let raw = {
+        let _s = tracing::trace_span!("search.bm25_topk", n_tokens = tokens.len()).entered();
+        bm25_index.top_k(&tokens, candidate_count, selector)
+    };
 
     let mut scores = vec![0.0f64; chunks.len()];
     for (idx, score) in &raw {
@@ -144,9 +155,18 @@ fn finalize_pure_mode(
     top_k: usize,
     source: SearchMode,
 ) -> Vec<SearchResult> {
-    boost_multi_chunk_files(&mut scores, chunks);
-    apply_query_boost(&mut scores, query, chunks);
-    let ranked = rerank_topk(&scores, chunks, top_k, true);
+    {
+        let _s = tracing::trace_span!("search.boost_multi_chunk").entered();
+        boost_multi_chunk_files(&mut scores, chunks);
+    }
+    {
+        let _s = tracing::trace_span!("search.apply_query_boost").entered();
+        apply_query_boost(&mut scores, query, chunks);
+    }
+    let ranked = {
+        let _s = tracing::trace_span!("search.rerank_topk").entered();
+        rerank_topk(&scores, chunks, top_k, true)
+    };
     ranked
         .into_iter()
         .map(|(idx, score)| SearchResult {
@@ -169,6 +189,7 @@ pub fn search_hybrid(
     alpha: Option<f64>,
     selector: Option<&[usize]>,
 ) -> Vec<SearchResult> {
+    let _span = tracing::trace_span!("search.hybrid", top_k, n_chunks = chunks.len()).entered();
     if should_skip_search(query, top_k, chunks) {
         return Vec::new();
     }
@@ -177,8 +198,14 @@ pub fn search_hybrid(
     let n = chunks.len();
 
     // Semantic candidates → indexed RRF scores.
-    let query_emb = model.encode(&[query.to_string()]);
-    let (sem_idx, sem_sim) = dense_index.query(&query_emb[0], candidate_count, selector);
+    let query_emb = {
+        let _s = tracing::trace_span!("search.encode_query").entered();
+        model.encode(&[query.to_string()])
+    };
+    let (sem_idx, sem_sim) = {
+        let _s = tracing::trace_span!("search.dense_query", candidate_count).entered();
+        dense_index.query(&query_emb[0], candidate_count, selector)
+    };
     let sem_topk: Vec<(usize, f64)> = sem_idx
         .into_iter()
         .zip(sem_sim)
@@ -190,6 +217,7 @@ pub fn search_hybrid(
     let bm25_topk = if tokens.is_empty() {
         Vec::new()
     } else {
+        let _s = tracing::trace_span!("search.bm25_topk", n_tokens = tokens.len()).entered();
         bm25_index.top_k(&tokens, candidate_count, selector)
     };
 
@@ -209,11 +237,20 @@ pub fn search_hybrid(
     }
 
     // Boost multi-chunk files, then apply query-type boosts.
-    boost_multi_chunk_files(&mut combined, chunks);
-    apply_query_boost(&mut combined, query, chunks);
+    {
+        let _s = tracing::trace_span!("search.boost_multi_chunk").entered();
+        boost_multi_chunk_files(&mut combined, chunks);
+    }
+    {
+        let _s = tracing::trace_span!("search.apply_query_boost").entered();
+        apply_query_boost(&mut combined, query, chunks);
+    }
 
     // Rerank top-k with path penalties + file saturation.
-    let ranked = rerank_topk(&combined, chunks, top_k, alpha_weight < 1.0);
+    let ranked = {
+        let _s = tracing::trace_span!("search.rerank_topk").entered();
+        rerank_topk(&combined, chunks, top_k, alpha_weight < 1.0)
+    };
 
     ranked
         .into_iter()
